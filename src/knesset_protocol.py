@@ -9,8 +9,8 @@ from typing import Any, Dict, List
 
 import polars as pl
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
-import pyarrow.parquet as pq
 import re2 as google_re2
 from nltk.tokenize import PunktSentenceTokenizer
 
@@ -237,8 +237,28 @@ class KnessetProtocol:
             # Read the dataset using PyArrow with Hive partitioning
             dataset = ds.dataset(source=processed_data_path, format="parquet", partitioning=ds.HivePartitioning(schema=schema))
 
+            # Create an expression using PyArrow's compute module
+            filter_expr = None
+            for column, operator, value in filters:
+                if operator == "=":
+                    condition = pc.field(column) == value
+                elif operator == "!=":
+                    condition = pc.field(column) != value
+                elif operator == ">":
+                    condition = pc.field(column) > value
+                elif operator == "<":
+                    condition = pc.field(column) < value
+                elif operator == ">=":
+                    condition = pc.field(column) >= value
+                elif operator == "<=":
+                    condition = pc.field(column) <= value
+                else:
+                    raise ValueError(f"Unsupported operator: {operator}")
+
+                filter_expr = condition if filter_expr is None else filter_expr & condition
+
             # Apply the filters when converting the dataset to a PyArrow Table
-            arrow_table = dataset.to_table(filter=filters)
+            arrow_table = dataset.to_table(filter=filter_expr)
 
             # Convert the PyArrow Table to a Polars DataFrame
             self.res = pl.from_arrow(arrow_table)

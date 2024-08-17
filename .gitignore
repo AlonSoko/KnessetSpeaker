@@ -2,3 +2,4 @@
 __pycache__/
 data/raw/
 .vscode/
+examples/.ipynb_checkpoints/
