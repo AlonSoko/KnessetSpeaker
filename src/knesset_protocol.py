@@ -217,6 +217,7 @@ class KnessetProtocol:
             self.get_first_speaker_paragraph_index()
             self.get_last_speaker_paragraph_index()
             self.raw_text = self.raw_text[self.first_speaker_paragraph_index : self.last_speaker_paragraph_index]
+            self.remove_titles()  # This is purposefully after get_last_speaker_paragraph_index and the slicing, sometimes הישיבה ננעלה בשעה 12:00 is a title
 
             # Advanced
             self.extract_speaker_indexes()
@@ -365,97 +366,78 @@ class KnessetProtocol:
             import win32com.client as win32
 
             # Initialize COM object
-            word = win32.Dispatch("Word.Application")
-            word.Visible = False
+            word_application = win32.Dispatch("Word.Application")
+            word_application.Visible = False
 
             # Open the specific document and work with it directly
-            doc = word.Documents.Open(document_path, ReadOnly=True)
+            word_document = word_application.Documents.Open(document_path, ReadOnly=True)
 
             # Extract and split into different paragraphs based on underline transitions
             paragraphs: List[Paragraph] = []
 
-            for par in doc.Paragraphs:
+            for paragraph in word_document.Paragraphs:
                 # Initialize to True
                 is_first_paragraph_amongst_split_paragraphs = True
 
-                # We check if the entire paragraph is under-lined
-                is_fully_underlined = True
-                for char_range in par.Range.Characters:
-                    char_text = char_range.Text
+                current_paragraph = None
+                last_underline_status = None
 
-                    # Ignore spaces and tabs
-                    if char_text in [" ", "\t"]:
-                        continue
+                for word in paragraph.Range.Words:
+                    word_text = word.Text
 
-                    # Check if the character is underlined
-                    if not char_range.Underline:  # If any non-space/tab character is not underlined
-                        is_fully_underlined = False
-                        break  # No need to check further, paragraph is not fully underlined
+                    # Only consider non-empty words
+                    if word_text.strip():
+                        # Check if the string is only punctuation
+                        is_punctuation = len(google_re2.sub(r"[:;.,!?-]", "", word_text.strip())) == 0
 
-                # If the entire paragraph is underlined, and it does match the speaker regex, it's a title
-                # For example: חשיפת ישראל לסיכונים ביטחוניים-צבאיים in 13_ptm_532025.docx
-
-                # We only care about spoken text, if it's a title we ignore it
-                if not (is_fully_underlined and not google_re2.match(speaker_regex, par.Range.Text.strip())):
-                    current_paragraph = ""
-                    last_underline_status = None
-
-                    for char_range in par.Range.Characters:
-                        char_text = char_range.Text
-
-                        # Check if the character is a punctuation mark
-                        is_punctuation = char_text in [":", ";", ".", ",", "!", "?", "-"]
-
-                        # We want punctuation to take the same underline status as the character before it
+                        # We want punctuation to take the same underline status as the word before it
                         #
                         # We have cases where: יו"ר הכנסת ישראל ישראלי: is all underlined
                         # But we also have cases where it's all underlined, except the punctuation, but we want it in the same paragraph
-                        if is_punctuation and (last_underline_status is not None):
-                            is_underlined = last_underline_status
-
-                        else:
-                            is_underlined = char_range.Underline != 0
+                        is_underlined = (
+                            last_underline_status if (is_punctuation and (last_underline_status is not None)) else (word.Font.Underline != 0)
+                        )
 
                         # If the underline status changes, start a new paragraph
                         if (last_underline_status is not None) and (is_underlined != last_underline_status):
-                            if current_paragraph and current_paragraph.strip():
-                                # Remove leading and trailing whitespaces
-                                current_paragraph = current_paragraph.strip()
+                            if current_paragraph:
                                 # Replace multiple spaces or tabs with a single space
                                 current_paragraph = google_re2.sub(r"[\s\t]+", " ", current_paragraph)
 
                                 paragraphs.append(
                                     Paragraph(
+                                        # Remove leading and trailing whitespaces
                                         text=current_paragraph.strip(),
                                         is_underlined=last_underline_status,
                                         is_first_paragraph_amongst_split_paragraphs=is_first_paragraph_amongst_split_paragraphs,
                                     )
                                 )
-                                is_first_paragraph_amongst_split_paragraphs = False
-                                current_paragraph = ""
 
-                        current_paragraph += char_text
+                                # Mark that the next paragraph is not the first one amongst split paragraphs
+                                is_first_paragraph_amongst_split_paragraphs = False
+
+                                # Reset current_paragraph
+                                current_paragraph = None
+
+                        current_paragraph = word_text if (current_paragraph is None) else (current_paragraph + word_text)
                         last_underline_status = is_underlined
 
-                    # Append the last paragraph section if it exists
-                    if current_paragraph and current_paragraph.strip():
-                        # Remove leading and trailing whitespaces
-                        current_paragraph = current_paragraph.strip()
-                        # Replace multiple spaces or tabs with a single space
-                        current_paragraph = google_re2.sub(r"[\s\t]+", " ", current_paragraph)
+                # Append the last paragraph if it exists
+                if current_paragraph:
+                    # Replace multiple spaces or tabs with a single space
+                    current_paragraph = google_re2.sub(r"[\s\t]+", " ", current_paragraph)
 
-                        paragraphs.append(
-                            Paragraph(
-                                text=current_paragraph.strip(),
-                                is_underlined=is_underlined,
-                                is_first_paragraph_amongst_split_paragraphs=is_first_paragraph_amongst_split_paragraphs,
-                            )
+                    paragraphs.append(
+                        Paragraph(
+                            text=current_paragraph.strip(),
+                            is_underlined=is_underlined,
+                            is_first_paragraph_amongst_split_paragraphs=is_first_paragraph_amongst_split_paragraphs,
                         )
-                        is_first_paragraph_amongst_split_paragraphs = False
+                    )
 
             # Close the document without saving changes and quit Word application
-            doc.Close(False)
-            word.Quit()
+            word_document.Close(False)
+            word_application.Quit()
 
             return paragraphs
 
@@ -711,6 +693,49 @@ class KnessetProtocol:
 
         if self.last_speaker_paragraph_index is None:
             raise ValueError("Did not find last_speaker_paragraph_index!")
+
+    def remove_titles(self):
+        """
+        Removes paragraphs identified as titles from the document's raw text.
+
+        A paragraph is considered a title if it is fully underlined and not identified as a speaker.
+        The method filters out such paragraphs from the `self.raw_text` attribute.
+
+        """
+
+        def __is_title(paragraph) -> bool:
+            """
+            Determines if a given paragraph should be considered a title based on its formatting and content.
+
+            The function checks whether the paragraph is underlined. If so, and if the paragraph is not
+            identified as a speaker - it is considered a title.
+
+            Args:
+                paragraph: The paragraph to be evaluated.
+
+            Returns:
+                bool: True if the paragraph is underlined and not identified as a speaker, indicating it is a title.
+                      False otherwise.
+
+            Example:
+                For example, the title "חשיפת ישראל לסיכונים ביטחוניים-צבאיים" in the document "13_ptm_532025.docx"
+                is fully underlined and is not a speaker - therefore identified as a title by this function.
+            """
+
+            # Only Hebrew / English / Digit / : / " / ' characters
+            paragraph["text"] = google_re2.sub(r"[^א-תa-zA-Z0-9:\"']+", " ", paragraph["text"]).strip()
+
+            # Replace " / ' with empty string
+            paragraph["text"] = google_re2.sub(r"[\"']+", "", paragraph["text"])
+
+            # Replace multiple spaces with a single space
+            paragraph["text"] = google_re2.sub(r"\s+", " ", paragraph["text"])
+
+            is_speaker = google_re2.match(speaker_regex, paragraph["text"].strip())
+
+            return paragraph["is_underlined"] and paragraph["is_first_paragraph_amongst_split_paragraphs"] and not is_speaker
+
+        self.raw_text = [paragraph for paragraph in self.raw_text if not __is_title(paragraph)]
 
     def extract_speaker_indexes(self):
         """
