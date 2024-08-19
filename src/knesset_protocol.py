@@ -683,6 +683,16 @@ class KnessetProtocol:
                 # If if it's a newline, it means this underline text is the start of a paragraph
                 is_paragraph_start = prev_char_range.Text in ["\r", "\n"]
 
+            # If the underline text is not at the very end of the document, we want to get one char after it
+            if chairman_search_range.End < word_document.Content.End:
+                # Get the character just after the underline text
+                next_char_range = word_document.Range(Start=chairman_search_range.End, End=chairman_search_range.End + 1)
+
+                # If it's :, we want to add it to underlined text
+                # Sometimes we have : which are not underlined, but the entire text before them is underlined, and it is a speaker
+                if next_char_range.Text == ":":
+                    underline_text += ":"
+
             is_centered = chairman_search_range.ParagraphFormat.Alignment == wdAlignParagraphCenter
 
             if KnessetProtocol.is_chairman(is_underline=True, is_centered=is_centered, is_paragraph_start=is_paragraph_start, text=underline_text):
@@ -881,6 +891,13 @@ class KnessetProtocol:
 
         # Initialize the search
         while speaker_search_range.Find.Execute():
+            # Check if the found range exceeds the last_speaker_index
+            #
+            # NOTICE: Apparently, even though we specified Range(Start=self.first_speaker_index, End=self.last_speaker_index),
+            # certain operations, such as Find, can sometimes extend the search beyond the defined End position.
+            if speaker_search_range.End > self.last_speaker_index:
+                break  # Exit the loop if the range exceeds the specified end
+
             # Get the underline text
             underline_text = speaker_search_range.Text
 
@@ -888,7 +905,7 @@ class KnessetProtocol:
             is_paragraph_start = False
 
             # If the underline text is at the very start of the document, it's obviously the start of a paragraph
-            if speaker_search_range.Start == word_document.Content.Start:
+            if speaker_search_range.Start == self.first_speaker_index:
                 is_paragraph_start = True
 
             else:
@@ -897,6 +914,16 @@ class KnessetProtocol:
 
                 # If if it's a newline, it means this underline text is the start of a paragraph
                 is_paragraph_start = prev_char_range.Text in ["\r", "\n"]
+
+            # If the underline text is not at the very end of the document, we want to get one char after it
+            if speaker_search_range.End < self.last_speaker_index:
+                # Get the character just after the underline text
+                next_char_range = word_document.Range(Start=speaker_search_range.End, End=speaker_search_range.End + 1)
+
+                # If it's :, we want to add it to underlined text
+                # Sometimes we have : which are not underlined, but the entire text before them is underlined, and it is a speaker
+                if next_char_range.Text == ":":
+                    underline_text += ":"
 
             # Check if the text is centered
             is_centered = speaker_search_range.ParagraphFormat.Alignment == wdAlignParagraphCenter
@@ -998,7 +1025,7 @@ class KnessetProtocol:
             for current_speaker_name, current_speaker_end_index, next_speaker_start_index in zip(
                 [speaker_name_index["speaker_name"] for speaker_name_index in self.speaker_names_indexes],
                 [speaker_name_index["end_index"] for speaker_name_index in self.speaker_names_indexes],
-                [speaker_name_index["start_index"] for speaker_name_index in self.speaker_names_indexes][1:] + [word_document.Content.End],
+                [speaker_name_index["start_index"] for speaker_name_index in self.speaker_names_indexes][1:] + [self.last_speaker_index],
             ):
                 # We want to see if there's any irrelevant in the way between current_speaker and next_speaker
                 current_speaker_irrelevants = [
