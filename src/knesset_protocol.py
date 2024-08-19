@@ -145,6 +145,11 @@ chairman_variations = [
     "יושבת הראש",
 ]
 
+# Sort chairman_variations by length in descending order to prioritize longer matches
+# WARNING: Do not delete this, otherwise we might have cases where:
+# השרה לביטחון לאומי לימור לבנת -> לאומי לימור לבנת because it matched on ביטחון before ביטחון לאומי.
+chairman_variations.sort(key=len, reverse=True)
+
 # All the possible variations of the word parliament member - חבר כנסת
 # NOTICE: Later on I ignore all special characters, that's why variations like חבר-כנסת or חה"כ are not in here
 parliament_member_variations = [
@@ -159,6 +164,121 @@ parliament_member_variations = [
     "חברת כנסת",
     "חברת הכנסת",
 ]
+
+# Sort parliament_member_variations by length in descending order to prioritize longer matches
+# WARNING: Do not delete this, otherwise we might have cases where:
+# השרה לביטחון לאומי לימור לבנת -> לאומי לימור לבנת because it matched on ביטחון before ביטחון לאומי.
+parliament_member_variations.sort(key=len, reverse=True)
+
+# All the possible variations of the word minister - שר
+# NOTICE: Later on I ignore all special characters, that's why variations like חבר-כנסת or חה"כ are not in here
+minister_variations = [
+    # Male
+    "שר",
+    "השר",
+    # Female
+    "שרה",
+    "השרה",
+    "שרת",
+]
+
+# Sort minister_variations by length in descending order to prioritize longer matches
+# WARNING: Do not delete this, otherwise we might have cases where:
+# השרה לביטחון לאומי לימור לבנת -> לאומי לימור לבנת because it matched on ביטחון before ביטחון לאומי.
+minister_variations.sort(key=len, reverse=True)
+
+# All the minister office
+# NOTICE: I don't put האוצר or והחינוך or לביטחון לאומי - I later on address this in the regex, no need for duplications in the here
+minister_offices = [
+    "חינוך",
+    "אוצר",
+    "אנרגיה",
+    "תשתיות",
+    "ביטחון",
+    "ביטחון לאומי",
+    "משטרה",
+    "חיזוק וקידום קהילתי",
+    "בינוי",
+    "שיכון",
+    "בריאות",
+    "הגנת הסביבה",
+    "הסברה",
+    "התיישבות",
+    "משימות לאומיות",
+    "חדשנות",
+    "מדע",
+    "טכנולוגיה",
+    "חוץ",
+    "חקלאות",
+    "ביטחון המזון",
+    "ירושלים",
+    "מורשת",
+    "מסורת ישראל",
+    "כלכלה",
+    "תעשייה",
+    "מודיעין",
+    "מורשת",
+    "משפטים",
+    "עניינים אסטרטגיים",
+    "עבודה",
+    "עלייה",
+    "קליטה",
+    "נגב",
+    "גליל",
+    "חוסן לאומי",
+    "ירושלים",
+    "פנים",
+    "קידום מעמד האישה",
+    "רווחה",
+    "ביטחון חברתי",
+    "שוויון חברתי",
+    "שירותי דת",
+    "שיתוף פעולה אזורי",
+    "תחבורה",
+    "בטיחות בדרכים",
+    "תיירות",
+    "תפוצות",
+    "מאבק באנטישמיות",
+    "תקשורת",
+    "תרבות",
+    "ספורט",
+    "איכות הסביבה",
+    "חקלאות",
+    "אומנויות",
+    "ענייני",
+    "דתות",
+    "קליטת עלייה",
+    "מסחר",
+    "סעד",
+    "תכנון",
+    "פיתוח",
+    "דואר",
+]
+
+# Sort minister_offices by length in descending order to prioritize longer matches
+# WARNING: Do not delete this, otherwise we might have cases where:
+# השרה לביטחון לאומי לימור לבנת -> לאומי לימור לבנת because it matched on ביטחון before ביטחון לאומי.
+minister_offices.sort(key=len, reverse=True)
+
+# All the possible variations of the word prime minister - ראש הממשלה
+# NOTICE: Later on I ignore all special characters, that's why variations like רוה"מ are not in here
+prime_minister_variations = [
+    # Same for both genders
+    "רוהמ"
+    # Male
+    "ראש הממשלה",
+    "ראש ממשלה",
+    "ראש ממשלת ישראל"
+    # Female
+    "ראשת הממשלה",
+    "ראשת ממשלה",
+    "ראשת ממשלת ישראל",
+]
+
+# Sort prime_minister_variations by length in descending order to prioritize longer matches
+# WARNING: Do not delete this, otherwise we might have cases where:
+# השרה לביטחון לאומי לימור לבנת -> לאומי לימור לבנת because it matched on ביטחון before ביטחון לאומי.
+prime_minister_variations.sort(key=len, reverse=True)
 
 chairman_regex = rf"<*(?:{'|'.join(chairman_variations)})(?:\s[א-ת]+)*\s?:>*"
 chairman_min_words = 3
@@ -697,9 +817,32 @@ class KnessetProtocol:
         # 3. If it's in the middle of the name
         clean_speaker_name = re2.sub(rf"\s+(?:{'|'.join(parliament_member_variations)})\s+", "", clean_speaker_name)
 
-        # TODO: Add removal of minister - השר לביטחון פנים, שרת החינוך והספורט, etc...
+        # Remove minister variations
+        # I only want exact matches, I don't want to delete semi-matches, for example: שרה is a legitimate name
 
-        # TODO: Add removal of prime minister - ראש הממשלה, רוה"מ, etc...
+        # Join minister variations with '|'
+        minister_variations_pattern = rf"(?:{'|'.join(minister_variations)})"
+
+        # Join minister offices with '|', allowing optional ' ', 'ו', 'ה', 'ל' before each office
+        minister_offices_pattern = rf"(?:\s*[ו|ה|ל]*(?:{'|'.join(minister_offices)}))"
+
+        # 1. If it's in the beginning of the name
+        clean_speaker_name = re2.sub(rf"^{minister_variations_pattern}\s+{minister_offices_pattern}+\s+", "", clean_speaker_name)
+        # 2. If it's in the end of the name
+        clean_speaker_name = re2.sub(rf"\s+{minister_variations_pattern}\s+{minister_offices_pattern}+$", "", clean_speaker_name)
+        # 3. If it's in the middle of the name
+        clean_speaker_name = re2.sub(rf"\s+{minister_variations_pattern}\s+{minister_offices_pattern}+\s+", "", clean_speaker_name)
+
+        # Remove prime minister variations
+        # I only want exact matches, I don't want to delete semi-matches, for example: רוהמאן is a legitimate name
+        #
+        # So I do it in 3 deletions -
+        # 1. If it's in the beginning of the name
+        clean_speaker_name = re2.sub(rf"^(?:{'|'.join(prime_minister_variations)})\s+", "", clean_speaker_name)
+        # 2. If it's in the end of the name
+        clean_speaker_name = re2.sub(rf"\s+(?:{'|'.join(prime_minister_variations)})$", "", clean_speaker_name)
+        # 3. If it's in the middle of the name
+        clean_speaker_name = re2.sub(rf"\s+(?:{'|'.join(prime_minister_variations)})\s+", "", clean_speaker_name)
 
         clean_speaker_name = clean_speaker_name.strip()
 
@@ -1218,6 +1361,8 @@ class KnessetProtocol:
             print(Delimiter)
             print("Not in self.speaker_to_person_mapping:")
             pprint(speakers.difference(set(self.speaker_to_person_mapping.keys())), sort_dicts=False)
+
+        # TODO: Replace with mapping
 
         # Add the person_id, all_person_id_matches to self.speaker_text_consecutive using self.speaker_to_person_mapping
         self.speaker_text_consecutive = [
