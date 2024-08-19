@@ -1,18 +1,26 @@
-import copy
 import itertools
 import os
 import platform
-import re as slow_re
 from difflib import SequenceMatcher
-from functools import wraps
-from typing import Any, Dict, List
+from pprint import pprint
+from typing import List
 
 import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
-import re2 as google_re2
+import re2
 from nltk.tokenize import PunktSentenceTokenizer
+
+wdAlignParagraphLeft = 0
+wdAlignParagraphCenter = 1
+wdAlignParagraphRight = 2
+wdAlignParagraphJustify = 3
+
+Delimiter = "*" + (100 * "-") + "*"
+
+# If the flag is true, enables debug prints
+is_debug = False
 
 # Get the path of the project
 project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -123,7 +131,7 @@ hebrew_numbers = {
 }
 
 # All the possible variations of the word chairman - יור
-# FYI: Later on I ignore all special characters, that's why variations like יושב-ראש or יו"ר are not in here
+# NOTICE: Later on I ignore all special characters, that's why variations like יושב-ראש or יו"ר are not in here
 chairman_variations = [
     # Same for both genders
     "יור",
@@ -138,7 +146,7 @@ chairman_variations = [
 ]
 
 # All the possible variations of the word parliament member - חבר כנסת
-# FYI: Later on I ignore all special characters, that's why variations like חבר-כנסת or חה"כ are not in here
+# NOTICE: Later on I ignore all special characters, that's why variations like חבר-כנסת or חה"כ are not in here
 parliament_member_variations = [
     # Same for both genders
     "חכ",
@@ -152,58 +160,40 @@ parliament_member_variations = [
     "חברת הכנסת",
 ]
 
-chairman_regex = rf"^<*(?:{'|'.join(chairman_variations)})(?:\s[א-ת]+)*:>*$"
-speaker_regex = rf"^<*(?:[א-ת]+)(?:\s[א-ת]+)*:>*$"
+chairman_regex = rf"<*(?:{'|'.join(chairman_variations)})(?:\s[א-ת]+)*\s?:>*"
+chairman_min_words = 3
+
+speaker_regex = rf"<*(?:[א-ת]+)(?:\s[א-ת]+)*\s?:>*"
+speaker_min_words = 2
+
 
 SIMILARITY_THRESHOLD = 0.9
-
-
-# Registry to hold file type handlers
-file_handlers: Dict[str, callable] = {}
-
-
-def register_file_handler(extension):
-    def decorator(func):
-        file_handlers[extension] = func
-
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
-
-
-class Paragraph:
-    def __init__(self, text: str, is_underlined: bool, is_first_paragraph_amongst_split_paragraphs: bool):
-        self.text = text
-        self.is_underlined = is_underlined
-        self.is_first_paragraph_amongst_split_paragraphs = is_first_paragraph_amongst_split_paragraphs
-
-    def __getitem__(self, key: str) -> Any:
-        return getattr(self, key)
-
-    def __setitem__(self, key: str, value: Any):
-        setattr(self, key, value)
 
 
 class KnessetProtocol:
     def __init__(self, **kwargs):
         """
-        Initializes the object with either a document_path or filters.
+        We can specify a debug status.
+
+        Then, initializes the object with either a document_path or filters.
 
         Depending on the provided arguments, the initialization will either:
         1. document_path - Process a new protocol.
         2. filters - Apply filters to load an existing protocol.
 
         Args:
+            is_debug (bool, optional): If we want to specify a debug status.
             document_path (str, optional): The path to the document containing the protocol to be processed.
             filters (list of tuples, optional): A list of filter conditions to selectively read partitions from a protocol.
 
         Raises:
             ValueError: If neither `document_path` nor `filters` are provided.
         """
+
+        global is_debug
+
+        if "is_debug" in kwargs:
+            is_debug = kwargs["is_debug"]
 
         # Option 1: Process a new protocol if a document_path is provided
         if "document_path" in kwargs:
@@ -212,17 +202,8 @@ class KnessetProtocol:
             # Basic
             self.validate_document_name(document_path)
             self.load_document(document_path)
-            self.extract_protocol_metadata(document_path)
-            self.remove_tags()
-            self.get_first_speaker_paragraph_index()
-            self.get_last_speaker_paragraph_index()
-            self.raw_text = self.raw_text[self.first_speaker_paragraph_index : self.last_speaker_paragraph_index]
-            self.remove_titles()  # This is purposefully after get_last_speaker_paragraph_index and the slicing, sometimes הישיבה ננעלה בשעה 12:00 is a title
 
             # Advanced
-            self.extract_speaker_indexes()
-            self.create_speaker_text_consecutive()
-            self.clean_speaker_names()
             self.metadata: pl.DataFrame = pl.read_parquet(metadata_path)
             self.map_speaker_to_person_id()
             self.split_text_to_sentences()
@@ -284,212 +265,38 @@ class KnessetProtocol:
             ValueError: If the document name does not follow the expected format.
         """
 
-        def generate_regex_pattern() -> str:
-            """
-            Generate a regex pattern based on the available file extensions in file_handlers.
-
-            Returns:
-                str: A regex pattern string.
-            """
-
-            # Get the available extensions from file_handlers and strip the dot.
-            extensions = "|".join([ext.lstrip(".") for ext in file_handlers.keys()])
-
-            # Generate the regex pattern dynamically.
-            pattern = rf"^\d{{1,3}}_(ptm|ptv)_\d+\.({extensions})$"
-
-            return pattern
-
         document_name = os.path.basename(document_path)
-        pattern = generate_regex_pattern()
+        pattern = rf"^\d{{1,3}}_(ptm|ptv)_\d+\.(doc|docx)$"
 
-        if not google_re2.match(pattern, document_name):
+        if not re2.match(pattern, document_name):
             raise ValueError(f"Invalid document name format: {document_name}. Expected format: {pattern}")
 
-    def load_document(self, document_path):
+    def extract_protocol_type(self, document_path):
         """
-        Loads the document from the specified path using the appropriate handler based on the file extension.
+        Extracts the protocol type (plenary or committee) from the document name.
 
-        This method first checks if the file exists and then determines the file extension to select the
-        correct handler from the `file_handlers` registry. The handler is responsible for parsing the document
-        and extracting the raw text.
+        This method analyzes the file name of the document to determine the protocol type
+        based on a specific code (`ptm` or `ptv`). The method identifies the protocol type
+        as "plenary" if the code is `ptv` and "committee" if the code is `ptm`.
 
         Args:
             document_path (str): The full path to the document file.
 
         Raises:
-            FileNotFoundError: If the specified document does not exist.
-            ValueError: If no handler is registered for the file's extension.
-        """
-
-        # Check if the file exists
-        if not os.path.isfile(document_path):
-            raise FileNotFoundError(f"The file at {document_path} does not exist.")
-
-        # Get the extension, and the handler
-        extension = os.path.splitext(document_path)[1].lower()
-        handler = file_handlers.get(extension)
-        if not handler:
-            raise ValueError(f"No handler registered for extension {extension}")
-
-        # Parse document
-        self.raw_text = handler(os.path.abspath(document_path))
-
-    @staticmethod
-    @register_file_handler(".docx")
-    @register_file_handler(".doc")
-    def parse_paragraphs_from_doc(document_path) -> List[Paragraph]:
-        """
-        Extracts paragraphs from a .docx or .doc file, supporting both Windows and Linux/macOS platforms.
-
-        On Windows:
-            Utilizes the win32com.client library to interact with Microsoft Word via COM objects.
-            Opens the specified document, and extracts each paragraph.
-
-        WARNING: I am purposefully not using python-docx, I encountered bugs (e.g., missing words or colons) when using it.
-        For example: in 16_ptm_129044.docx, instead of parsing היו"ר ראובן ריבלין:, it parses היו"ר :
-                    For this specific case I could've handled it with some elaborate regex,
-                    But I can just use Microsoft Word or Libre Office word instead of putting a band-aid on it,
-                    and who knows how many more bugs like this are in the text.
-
-        Args:
-            document_path (str): The full path to the .docx or .doc file from which to extract paragraphs.
-
-        Returns:
-            List[Paragraph]: A list of Paragraphs. Each containing the paragraph text and a flag `is_underlined`.
-
-        Raises:
-            NotImplementedError: If the function is run on an unsupported platform.
-        """
-
-        if platform.system() == "Windows":
-            import win32com.client as win32
-
-            # Initialize COM object
-            word_application = win32.Dispatch("Word.Application")
-            word_application.Visible = False
-
-            # Open the specific document and work with it directly
-            word_document = word_application.Documents.Open(document_path, ReadOnly=True)
-
-            # Extract and split into different paragraphs based on underline transitions
-            paragraphs: List[Paragraph] = []
-
-            for paragraph in word_document.Paragraphs:
-                # Initialize to True
-                is_first_paragraph_amongst_split_paragraphs = True
-
-                current_paragraph = None
-                last_underline_status = None
-
-                for word in paragraph.Range.Words:
-                    word_text = word.Text
-
-                    # Only consider non-empty words
-                    if word_text.strip():
-                        # Check if the string is only punctuation
-                        is_punctuation = len(google_re2.sub(r"[:;.,!?-]", "", word_text.strip())) == 0
-
-                        # We want punctuation to take the same underline status as the word before it
-                        #
-                        # We have cases where: יו"ר הכנסת ישראל ישראלי: is all underlined
-                        # But we also have cases where it's all underlined, except the punctuation, but we want it in the same paragraph
-                        is_underlined = (
-                            last_underline_status if (is_punctuation and (last_underline_status is not None)) else (word.Font.Underline != 0)
-                        )
-
-                        # If the underline status changes, start a new paragraph
-                        if (last_underline_status is not None) and (is_underlined != last_underline_status):
-                            if current_paragraph:
-                                # Replace multiple spaces or tabs with a single space
-                                current_paragraph = google_re2.sub(r"[\s\t]+", " ", current_paragraph)
-
-                                paragraphs.append(
-                                    Paragraph(
-                                        # Remove leading and trailing whitespaces
-                                        text=current_paragraph.strip(),
-                                        is_underlined=last_underline_status,
-                                        is_first_paragraph_amongst_split_paragraphs=is_first_paragraph_amongst_split_paragraphs,
-                                    )
-                                )
-
-                                # Mark that the next paragraph is not the first one amongst split paragraphs
-                                is_first_paragraph_amongst_split_paragraphs = False
-
-                                # Reset current_paragraph
-                                current_paragraph = None
-
-                        current_paragraph = word_text if (current_paragraph is None) else (current_paragraph + word_text)
-                        last_underline_status = is_underlined
-
-                # Append the last paragraph if it exists
-                if current_paragraph:
-                    # Replace multiple spaces or tabs with a single space
-                    current_paragraph = google_re2.sub(r"[\s\t]+", " ", current_paragraph)
-
-                    paragraphs.append(
-                        Paragraph(
-                            text=current_paragraph.strip(),
-                            is_underlined=is_underlined,
-                            is_first_paragraph_amongst_split_paragraphs=is_first_paragraph_amongst_split_paragraphs,
-                        )
-                    )
-
-            # Close the document without saving changes and quit Word application
-            word_document.Close(False)
-            word_application.Quit()
-
-            return paragraphs
-
-        else:
-            raise NotImplementedError(f"Platform {platform.system()} is not supported.")
-
-    def extract_protocol_metadata(self, document_path):
-        """
-        Extracts and stores the metadata related to the protocol from the document path.
-
-        This method gathers key metadata about the protocol by extracting the protocol type,
-        Knesset number, protocol number, and protocol name from the document's file name and contents.
-        The extracted values are stored in the corresponding attributes of the `KnessetProtocol` instance.
-
-        Args:
-            document_path (str): The full path to the document file.
-        """
-
-        self.protocol_type = KnessetProtocol.extract_protocol_type(document_path)
-        self.knesset_number = KnessetProtocol.extract_knesset_number(document_path)
-        self.protocol_number = self.extract_protocol_number()
-        self.protocol_name = os.path.basename(document_path)
-
-    @staticmethod
-    def extract_protocol_type(document_path) -> str:
-        """
-        Determines the protocol type (plenary or committee) from the document name.
-
-        This method searches the document's file name for a specific code (`ptm` or `ptv`) that
-        indicates the type of protocol. It returns "plenary" if the code is `ptv` and "committee" if the code is `ptm`.
-
-        Args:
-            document_path (str): The full path to the document file.
-
-        Returns:
-            str: The protocol type, either "plenary" or "committee".
-
-        Raises:
-            ValueError: If the protocol type cannot be found in the document name.
+            ValueError: If the protocol type cannot be identified from the document name.
         """
 
         document_name = os.path.basename(document_path)
-        match = google_re2.search(r"_(ptm|ptv)_", document_name)
+        match = re2.search(r"_(ptm|ptv)_", document_name)
 
         if match:
             protocol_code = match.group(1)
-            return "plenary" if protocol_code == "ptv" else "committee"
+            self.protocol_type = "plenary" if protocol_code == "ptv" else "committee"
+
         else:
             raise ValueError("Protocol type not found in the document name")
 
-    @staticmethod
-    def extract_knesset_number(document_path) -> int:
+    def extract_knesset_number(self, document_path):
         """
         Extracts the Knesset number from the document name.
 
@@ -499,20 +306,31 @@ class KnessetProtocol:
         Args:
             document_path (str): The full path to the document file.
 
-        Returns:
-            int: The Knesset number extracted from the document name.
-
         Raises:
             ValueError: If the Knesset number cannot be found in the document name.
         """
 
         document_name = os.path.basename(document_path)
-        match = google_re2.match(r"^(\d{1,3})_", document_name)
+        match = re2.match(r"^(\d{1,3})_", document_name)
 
         if match:
-            return int(match.group(1))
+            self.knesset_number = int(match.group(1))
         else:
             raise ValueError("Knesset number not found in the document name")
+
+    def extract_protocol_name(self, document_path):
+        """
+        Extracts and stores the protocol name from the document file name.
+
+        This method extracts the base name of the document from the provided file path
+        and stores it as the `protocol_name` attribute of the instance. The base name
+        is the file name without the directory path.
+
+        Args:
+            document_path (str): The full path to the document file.
+        """
+
+        self.protocol_name = os.path.basename(document_path)
 
     @staticmethod
     def parse_hebrew_number(paragraph: str) -> int:
@@ -532,13 +350,15 @@ class KnessetProtocol:
         """
 
         # Only Hebrew / English / Digit characters
-        paragraph = google_re2.sub(r"[^א-תa-zA-Z0-9]+", " ", paragraph).strip()
+        paragraph = re2.sub(r"[^א-תa-zA-Z0-9]+", " ", paragraph)
 
         # Remove connecting ו'
-        paragraph = google_re2.sub(r" ו", " ", paragraph).strip()
+        paragraph = re2.sub(r" ו", " ", paragraph)
 
         # Replace multiple spaces with a single space
-        paragraph = google_re2.sub(r"\s+", " ", paragraph)
+        paragraph = re2.sub(r"\s+", " ", paragraph)
+
+        paragraph = paragraph.strip()
 
         res = None
 
@@ -561,7 +381,7 @@ class KnessetProtocol:
         return res
 
     @staticmethod
-    def parse_number(paragraph: str) -> int:
+    def parse_digit_number(paragraph: str) -> int:
         """
         Parses and extracts the first numerical value from a paragraph.
 
@@ -577,46 +397,508 @@ class KnessetProtocol:
         """
 
         # Only Hebrew / English / Digit characters
-        paragraph = google_re2.sub(r"[^א-תa-zA-Z0-9]+", " ", paragraph).strip()
+        paragraph = re2.sub(r"[^א-תa-zA-Z0-9]+", " ", paragraph)
 
         # Replace multiple spaces with a single space
-        paragraph = google_re2.sub(r"\s+", " ", paragraph)
+        paragraph = re2.sub(r"\s+", " ", paragraph)
+
+        paragraph = paragraph.strip()
 
         return int(paragraph.split(" ")[0]) if paragraph.split(" ")[0].isdecimal() else None
 
-    def extract_protocol_number(self) -> int:
+    # TODO: Add support for Linux / MacOS
+    def extract_protocol_number_windows(self, word_document):
         """
-        Extracts the protocol number from the document's text.
+        Extracts the protocol number from a given Word document.
 
-        We handle 2 cases:
-        1. The protocol number is in Hebrew, for example: הישיבה המאה-וחמישים-ושתיים של הכנסת השלוש-עשרה
-        2. The protocol number is numerical, for example: הישיבה ה152
+        The method searches for specific keywords within the document to locate the protocol number.
+        It identifies the paragraph containing the keyword and attempts to parse the protocol number
+        immediately following the keyword. The protocol number can be in Hebrew or numeric format.
 
-        Returns:
-            str: The protocol number if found, otherwise None.
+        Args:
+            word_document: A COM object representing the Word document to be searched.
+
+        Attributes:
+            self.protocol_number (str or None): The parsed protocol number, if found. If no number is found, it remains None.
+
+        Raises:
+            ValueError: If no protocol number can be parsed from the document.
         """
 
-        protocol_number = None
+        # Initialize protocol number to None
+        self.protocol_number = None
+
         keywords = ["הישיבה", "פרוטוקול מס"]
 
-        for paragraph in self.raw_text:
-            if any(keyword in paragraph["text"] for keyword in keywords):
-                # We split by the keyword, and we want the sentence immediately after it
-                potential_protocol_number = google_re2.split(r"|".join(keywords), paragraph["text"])[1]
+        # Set up for each keyword their keyword_search_range
+        keyword_search_ranges = []
+        for keyword in ["הישיבה", "פרוטוקול מס"]:
+            # Set up the initial range for searching
+            keyword_search_range = word_document.Content
 
-                # 1. We attempt to parse a Hebrew number
-                protocol_number = KnessetProtocol.parse_hebrew_number(potential_protocol_number)
+            # Use the Find object to search for specific keywords
+            keyword_search_range.Find.ClearFormatting()
+            keyword_search_range.Find.Text = keyword
 
-                # 2. Attempt to parse a number
-                if protocol_number is None:
-                    protocol_number = KnessetProtocol.parse_number(potential_protocol_number)
+            keyword_search_ranges.append(keyword_search_range)
 
-                # If we found a number from any of the methods, we don't have to go any longer
-                if protocol_number is not None:
-                    break
+        # We search using all keyword_search_ranges, until we find a match, or no more are left
+        while len(keyword_search_ranges) > 0:
+            # We run all the search ranges
+            results = {
+                keyword_search_range_index: keyword_search_range.Find.Execute()
+                for keyword_search_range_index, keyword_search_range in enumerate(keyword_search_ranges)
+            }
 
-        return protocol_number
+            # For each search_range, check if it found something
+            for keyword_search_range_index, found in results.items():
+                # If it no longer finds anything, we can remove it
+                if not found:
+                    del keyword_search_ranges[keyword_search_range_index]
 
+            # If after our deletion it's empty, break
+            if len(keyword_search_ranges) < 0:
+                break
+
+            # We want to find the argmin - the keyword_search_engine that found the earliest matching word
+            min_keyword_search_range = min(keyword_search_ranges, key=lambda keyword_search_range: keyword_search_range.Start)
+
+            # Extend the range to the end of the paragraph
+            paragraph_end_range = word_document.Range(Start=min_keyword_search_range.Start, End=min_keyword_search_range.Paragraphs(1).Range.End)
+            full_paragraph_text = paragraph_end_range.Text
+
+            # We split by the keyword, and we want the sentence immediately after it
+            potential_protocol_number = re2.split(r"|".join(keywords), full_paragraph_text)[1]
+
+            # 1. We attempt to parse a Hebrew number
+            self.protocol_number = KnessetProtocol.parse_hebrew_number(potential_protocol_number)
+
+            # 2. Attempt to parse a digit number
+            if self.protocol_number is None:
+                self.protocol_number = KnessetProtocol.parse_digit_number(potential_protocol_number)
+
+            # If we found a number from any of the methods, we don't have to search any more
+            if self.protocol_number is not None:
+                break
+
+            # Move the range start to the end of the last found item to continue searching
+            keyword_search_range.SetRange(min_keyword_search_range.End, word_document.Content.End)
+
+        if self.protocol_number is None:
+            raise ValueError("Could not parse protocol number!")
+
+    @staticmethod
+    def is_chairman(is_underline: bool, is_centered: bool, is_paragraph_start: bool, text: str) -> bool:
+        """
+        Determines if the given text refers to the Knesset chairman:
+        It verifies that the text is underlined, not centered, at the start of a paragraph, and matches the chairman_regex.
+
+        Args:
+            is_underline (bool): Indicates if the text is underlined.
+            is_underline (bool): Indicates if the text is centered.
+            is_paragraph_start (bool): Indicates if the text is at the start of a paragraph.
+            text (str): The text to be evaluated.
+
+        Returns:
+            bool: True if the refers to to the Knesset chairman, False otherwise.
+        """
+
+        if (not is_underline) or is_centered or (not is_paragraph_start):
+            return False
+
+        # Only Hebrew / English / Digit / : / " / ' characters
+        possible_chairman = re2.sub(r"[^א-תa-zA-Z0-9:\"']+", " ", text)
+
+        # Replace " / ' with empty string
+        possible_chairman = re2.sub(r"[\"']+", "", possible_chairman)
+
+        # Replace multiple spaces with a single space
+        possible_chairman = re2.sub(r"\s+", " ", possible_chairman)
+
+        possible_chairman = possible_chairman.strip()
+
+        if len(possible_chairman.split(" ")) >= chairman_min_words:
+            if any(chairman_variation in possible_chairman for chairman_variation in chairman_variations):
+                return bool(re2.match(chairman_regex, possible_chairman))
+
+        return False
+
+    # TODO: Add support for Linux / MacOS
+    def get_first_speaker_index_windows(self, word_document):
+        """
+        Identifies the starting index of the first speaker in the Word document.
+
+        The assumption is that the first speaker is always the Knesset chairman (יו"ר).
+
+        Args:
+            word_document: A COM object representing the Word document to be searched.
+        """
+
+        # Initialize first speaker index to None
+        self.first_speaker_index = None
+
+        # Set up the initial range for searching
+        chairman_search_range = word_document.Content
+
+        # Use the Find object to search for underline text
+        chairman_search_range.Find.ClearFormatting()
+        chairman_search_range.Find.Font.Underline = True
+
+        # Initialize the search
+        while chairman_search_range.Find.Execute():
+            # Get the underline text
+            underline_text = chairman_search_range.Text
+
+            # Check if it's at the start of a paragraph
+            is_paragraph_start = False
+
+            # If the underline text is at the very start of the document, it's obviously the start of a paragraph
+            if chairman_search_range.Start == word_document.Content.Start:
+                is_paragraph_start = True
+
+            else:
+                # Get the character just before the underline text
+                prev_char_range = word_document.Range(Start=chairman_search_range.Start - 1, End=chairman_search_range.Start)
+
+                # If if it's a newline, it means this underline text is the start of a paragraph
+                is_paragraph_start = prev_char_range.Text in ["\r", "\n"]
+
+            is_centered = chairman_search_range.ParagraphFormat.Alignment == wdAlignParagraphCenter
+
+            if KnessetProtocol.is_chairman(is_underline=True, is_centered=is_centered, is_paragraph_start=is_paragraph_start, text=underline_text):
+                self.first_speaker_index = chairman_search_range.Start
+                break
+
+        if self.first_speaker_index is None:
+            raise ValueError("Could not find first speaker index!")
+
+    # TODO: Add support for Linux / MacOS
+    def get_last_speaker_index_windows(self, word_document):
+        """
+        Identifies the starting index of the end of the Word document.
+
+        The assumption is that whether a committee or a plenary, it always ends with "הישיבה נגמרה בשעה HH:MM"
+
+        Args:
+            word_document: A COM object representing the Word document to be searched.
+        """
+
+        # Initialize last speaker index to None
+        self.last_speaker_index = None
+
+        # Set up the initial range for searching
+        meeting_end_search_range = word_document.Content
+
+        # Use the Find object to search for meeting end text
+        meeting_end_search_range.Find.ClearFormatting()
+        meeting_end_search_range.Find.Text = "הישיבה ננעלה"
+        meeting_end_search_range.Find.Forward = False  # Search from the bottom up
+
+        # Initialize the search
+        while meeting_end_search_range.Find.Execute():
+            # Check if it's at the start of a paragraph
+            is_paragraph_start = False
+
+            # If the meeting_end text is at the very start of the document, it's obviously the start of a paragraph
+            if meeting_end_search_range.Start == word_document.Content.Start:
+                is_paragraph_start = True
+
+            else:
+                # Get the character just before the meeting_end text
+                prev_char_range = word_document.Range(Start=meeting_end_search_range.Start - 1, End=meeting_end_search_range.Start)
+
+                # If if it's a newline, it means this meeting_end text is the start of a paragraph
+                is_paragraph_start = prev_char_range.Text in ["\r", "\n"]
+
+            if is_paragraph_start:
+                self.last_speaker_index = meeting_end_search_range.Start
+                break
+
+        if self.last_speaker_index is None:
+            raise ValueError("Could not find last speaker index!")
+
+    @staticmethod
+    def is_speaker(is_underline: bool, is_centered: bool, is_paragraph_start: bool, text: str) -> bool:
+        """
+        Determines if the given text refers to a speaker:
+        Verifies that the text is underlined, not centered, at the start of a paragraph, and matches the speaker_regex.
+
+        Args:
+            is_underline (bool): Indicates if the text is underlined.
+            is_centered (bool): Indicates if the text is centered.
+            is_paragraph_start (bool): Indicates if the text is at the start of a paragraph.
+            text (str): The text to be evaluated.
+
+        Returns:
+            bool: True if the refers to to a speaker, False otherwise.
+        """
+
+        if (not is_underline) or is_centered or (not is_paragraph_start):
+            return False
+
+        # Only Hebrew / English / Digit / : / " / ' characters
+        possible_speaker = re2.sub(r"[^א-תa-zA-Z0-9:\"']+", " ", text)
+
+        # Replace " / ' with empty string
+        possible_speaker = re2.sub(r"[\"']+", "", possible_speaker)
+
+        # Replace multiple spaces with a single space
+        possible_speaker = re2.sub(r"\s+", " ", possible_speaker)
+
+        possible_speaker = possible_speaker.strip()
+
+        if len(possible_speaker.split(" ")) >= speaker_min_words:
+            return bool(re2.match(speaker_regex, possible_speaker))
+
+        return False
+
+    def clean_speaker_name(speaker_name: str) -> str:
+        """
+        Cleans the speaker's name by removing party names, unwanted characters, and specific title variations.
+
+        Args:
+            speaker_name (str): The original speaker name to be cleaned.
+
+        Returns:
+            str: The cleaned speaker name.
+        """
+
+        # Remove party - for example: (ש"ס)
+        clean_speaker_name = re2.sub(r"\(.*?\)", "", speaker_name)
+
+        # Only Hebrew / English / Digit / " / ' characters
+        clean_speaker_name = re2.sub(r"[^א-תa-zA-Z0-9\"']+", " ", clean_speaker_name)
+
+        # Replace " / ' with empty string
+        clean_speaker_name = re2.sub(r"[\"']+", "", clean_speaker_name)
+
+        # Replace multiple spaces with a single space
+        clean_speaker_name = re2.sub(r"\s+", " ", clean_speaker_name)
+
+        # Remove chairman variations
+        # I only want exact matches, I don't want to delete semi-matches, for example: יורמן is a legitimate family name
+        #
+        # So I do it in 3 deletions -
+        # 1. If it's in the beginning of the name
+        clean_speaker_name = re2.sub(rf"^(?:{'|'.join(chairman_variations)})\s+", "", clean_speaker_name)
+        # 2. If it's in the end of the name
+        clean_speaker_name = re2.sub(rf"\s+(?:{'|'.join(chairman_variations)})$", "", clean_speaker_name)
+        # 3. If it's in the middle of the name
+        clean_speaker_name = re2.sub(rf"\s+(?:{'|'.join(chairman_variations)})\s+", "", clean_speaker_name)
+
+        # Remove parliament member variations
+        # I only want exact matches, I don't want to delete semi-matches, for example: חכים is a legitimate name
+        #
+        # So I do it in 3 deletions -
+        # 1. If it's in the beginning of the name
+        clean_speaker_name = re2.sub(rf"^(?:{'|'.join(parliament_member_variations)})\s+", "", clean_speaker_name)
+        # 2. If it's in the end of the name
+        clean_speaker_name = re2.sub(rf"\s+(?:{'|'.join(parliament_member_variations)})$", "", clean_speaker_name)
+        # 3. If it's in the middle of the name
+        clean_speaker_name = re2.sub(rf"\s+(?:{'|'.join(parliament_member_variations)})\s+", "", clean_speaker_name)
+
+        # TODO: Add removal of minister
+
+        clean_speaker_name = clean_speaker_name.strip()
+
+        return clean_speaker_name
+
+    # TODO: Add support for Linux / MacOS
+    def get_speakers_names_indexes_irrelevant_text_indexes_windows(self, word_document):
+        """
+        Identifies the names and starting indexes of all speakers, as well as irrelevant text sections, in the Word document.
+
+        This method searches for underlined text within the specified range of the document
+        (from `first_speaker_index` to `last_speaker_index`) to identify the names of speakers.
+        It checks if the underlined text is at the start of a paragraph and is centered,
+        appending the information to the `speaker_names_indexes` list if the text is identified as a speaker's name.
+
+        Additionally, it identifies irrelevant text sections, such as titles or occurrences of the words
+        "קריאה" or "קריאות", and appends these to the `irrelevant_text_indexes` list.
+
+        Args:
+            word_document: A COM object representing the Word document to be searched.
+
+        Raises:
+            ValueError: If no speaker indexes can be found in the specified range of the document.
+        """
+
+        # Initialize speaker_names_indexes and irrelevant indexes
+        self.speaker_names_indexes = []
+        self.irrelevant_text_indexes = []  # Titles and קריאה or קריאות
+
+        # Set up the initial range for searching
+        speaker_search_range = word_document.Range(Start=self.first_speaker_index, End=self.last_speaker_index)
+
+        # Use the Find object to search for underline text
+        speaker_search_range.Find.ClearFormatting()
+        speaker_search_range.Find.Font.Underline = True
+
+        # Initialize the search
+        while speaker_search_range.Find.Execute():
+            # Get the underline text
+            underline_text = speaker_search_range.Text
+
+            # Check if it's at the start of a paragraph
+            is_paragraph_start = False
+
+            # If the underline text is at the very start of the document, it's obviously the start of a paragraph
+            if speaker_search_range.Start == word_document.Content.Start:
+                is_paragraph_start = True
+
+            else:
+                # Get the character just before the underline text
+                prev_char_range = word_document.Range(Start=speaker_search_range.Start - 1, End=speaker_search_range.Start)
+
+                # If if it's a newline, it means this underline text is the start of a paragraph
+                is_paragraph_start = prev_char_range.Text in ["\r", "\n"]
+
+            # Check if the text is centered
+            is_centered = speaker_search_range.ParagraphFormat.Alignment == wdAlignParagraphCenter
+
+            if KnessetProtocol.is_speaker(is_underline=True, is_centered=is_centered, is_paragraph_start=is_paragraph_start, text=underline_text):
+                self.speaker_names_indexes.append(
+                    {
+                        "speaker_name": KnessetProtocol.clean_speaker_name(underline_text),
+                        "start_index": speaker_search_range.Start,
+                        "end_index": speaker_search_range.End,
+                    }
+                )
+
+            # If it's underlined (We know it is, we are searching for it), and it's a paragraph start, but it's not a speaker, it could be one of 3 options:
+            # 1. Titles - for example: הצעות סיעות שינוי, האיחוד הלאומי  – ישראל ביתנו – in 16_ptm_129044.docx
+            # 2. קריאה or קריאות
+            #
+            # 3. It's a string that contains something like \r\n\t etc...
+            #
+            # If it's the 3rd case, we want to ignore it.
+            # If it's the first two cases - we want ot add it to irrelevant text indexes, so we know to skip it when parsing consecutive texts
+
+            elif is_paragraph_start:
+                # If it's a string consisting of only new lines / tabs / etc... we want to ignore it for irrelevants, no reason to stop at it
+                if len(re2.sub(r"[\n\r\t\v\f]+", "", underline_text)) > 0:
+                    self.irrelevant_text_indexes.append(
+                        {
+                            "text": re2.sub(r"[\t\v\f]+", "", underline_text.strip()),  # This is just so it looks nice in the debug print
+                            "start_index": speaker_search_range.Start,
+                        }
+                    )
+
+        if len(self.speaker_names_indexes) == 0:
+            raise ValueError("Could not find speaker indexes!")
+
+    def load_document(self, document_path):
+        """
+        Loads and processes a Word document, extracting protocol metadata and speaker information.
+
+        This method handles the loading of a Word document using the COM object model on Windows. It extracts
+        various pieces of metadata such as the protocol type, Knesset number, protocol name, and protocol number.
+
+        The method also identifies the indexes of the first and last speakers in the document, collects speaker
+        names and irrelevant text indexes, and compiles a list of consecutive speaker texts.
+
+        Args:
+            document_path (str): The full path to the Word document to be loaded and processed.
+
+        Raises:
+            NotImplementedError: If the method is called on a non-Windows platform.
+        """
+
+        if platform.system() == "Windows":
+            import win32com.client as win32
+
+            # Initialize COM object
+            word_application = win32.Dispatch("Word.Application")
+            word_application.Visible = False
+
+            # Open the specific document and work with it directly
+            word_document = word_application.Documents.Open(document_path, ReadOnly=True)
+
+            # Extract the protocol metadata
+            self.extract_protocol_type(document_path)
+            self.extract_knesset_number(document_path)
+            self.extract_protocol_name(document_path)
+            self.extract_protocol_number_windows(word_document)
+
+            if is_debug:
+                print(Delimiter)
+                print(f"self.protocol_type: {self.protocol_type}")
+                print(f"self.knesset_number: {self.knesset_number}")
+                print(f"self.protocol_name: {self.protocol_name}")
+                print(f"self.protocol_number: {self.protocol_number}")
+
+            # Get first and last speaker index
+            self.get_first_speaker_index_windows(word_document)
+            self.get_last_speaker_index_windows(word_document)
+
+            if is_debug:
+                print(Delimiter)
+                print(f"self.first_speaker_index: {self.first_speaker_index}")
+                print(f"self.last_speaker_index: {self.last_speaker_index}")
+
+            # Get the speaker_names_indexes and irrelevant_text_indexes
+            self.get_speakers_names_indexes_irrelevant_text_indexes_windows(word_document)
+
+            if is_debug:
+                print(Delimiter)
+                print("self.speaker_names_indexes:")
+                pprint(self.speaker_names_indexes, sort_dicts=False)
+
+                print(Delimiter)
+                print("self.irrelevant_text_indexes")
+                pprint(self.irrelevant_text_indexes, sort_dicts=False)
+
+            # Create a list of consecutive speaker texts
+            self.speaker_text_consecutive = []
+            for current_speaker_name, current_speaker_end_index, next_speaker_start_index in zip(
+                [speaker_name_index["speaker_name"] for speaker_name_index in self.speaker_names_indexes],
+                [speaker_name_index["end_index"] for speaker_name_index in self.speaker_names_indexes],
+                [speaker_name_index["start_index"] for speaker_name_index in self.speaker_names_indexes][1:] + [word_document.Content.End],
+            ):
+                # We want to see if there's any irrelevant in the way between current_speaker and next_speaker
+                current_speaker_irrelevants = [
+                    text_index["start_index"]
+                    for text_index in self.irrelevant_text_indexes
+                    if (current_speaker_end_index <= text_index["start_index"] < next_speaker_start_index)
+                ]
+
+                if len(current_speaker_irrelevants) > 0:
+                    End = min(current_speaker_irrelevants)
+
+                else:
+                    End = next_speaker_start_index
+
+                # Get the text from the end of current_speaker, to the start of the next_speaker
+                text = word_document.Range(Start=current_speaker_end_index, End=End).text
+
+                # Replace all of them with space, later on we split to sentences correctly using ntlk
+                text = re2.sub(r"[\n\r\t\v\f]+", " ", text)
+
+                # Replace multiple spaces with a single space
+                text = re2.sub(r"\s+", " ", text)
+
+                text = text.strip()
+
+                self.speaker_text_consecutive.append(
+                    {
+                        "speaker_name": current_speaker_name,
+                        "text": text,
+                    }
+                )
+
+            if is_debug:
+                print(Delimiter)
+                print(f"self.speaker_text_consecutive[0:10]:")
+                pprint(self.speaker_text_consecutive[0:10], sort_dicts=False)
+
+            # Close the document without saving changes and quit Word application
+            word_document.Close(False)
+            word_application.Quit()
+
+        else:
+            raise NotImplementedError(f"Platform {platform.system()} is not supported.")
+
+    # TODO: Check if neccesary
     def remove_tags(self):
         """
         Removes tags from the raw text of the document.
@@ -628,214 +910,7 @@ class KnessetProtocol:
 
         # Remove the tags from the text
         for index in range(len(self.raw_text)):
-            self.raw_text[index]["text"] = google_re2.sub(r"<<.*?>>", "", self.raw_text[index]["text"]).strip()
-
-    def get_first_speaker_paragraph_index(self):
-        """
-        Determines the index of the first paragraph where the speaker begins, typically the chairman.
-
-        The method iterates through the raw text to find the first occurrence of a speaker's name, which is usually
-        the chairman. The chairman's name must match the predefined regex pattern and be fully underlined in the text.
-
-        Raises:
-            ValueError: If the first speaker paragraph index cannot be determined.
-        """
-
-        # The assumption is that the chairman is always the first speaker
-        self.first_speaker_paragraph_index = None
-
-        for index in range(len(self.raw_text)):
-            paragraph = copy.deepcopy(self.raw_text[index])
-
-            # Only Hebrew / English / Digit / : / " / ' characters
-            paragraph["text"] = google_re2.sub(r"[^א-תa-zA-Z0-9:\"']+", " ", paragraph["text"]).strip()
-
-            # Replace " / ' with empty string
-            paragraph["text"] = google_re2.sub(r"[\"']+", "", paragraph["text"])
-
-            # Replace multiple spaces with a single space
-            paragraph["text"] = google_re2.sub(r"\s+", " ", paragraph["text"])
-
-            if any(chairman_variation in paragraph["text"] for chairman_variation in chairman_variations):
-                # If it's underlined and is_first_paragraph_amongst_split_paragraphs and matches the chairman regex
-                if (
-                    paragraph["is_underlined"]
-                    and paragraph["is_first_paragraph_amongst_split_paragraphs"]
-                    and google_re2.match(chairman_regex, paragraph["text"])
-                ):
-                    self.first_speaker_paragraph_index = index
-
-            if self.first_speaker_paragraph_index is not None:
-                break
-
-        if self.first_speaker_paragraph_index is None:
-            raise ValueError("Did not find first_speaker_paragraph_index!")
-
-    def get_last_speaker_paragraph_index(self):
-        """
-        Determines the index of the last paragraph where the speaker ends, typically when the session adjourns.
-
-        The method iterates through the raw text from the end to find the last occurrence of a specific
-        phrase that indicates the session has ended, such as "הישיבה ננעלה".
-
-        Raises:
-            ValueError: If the last speaker paragraph index cannot be determined.
-        """
-
-        # The assumption is that whether a committee or a plenary, it always ends with "הישיבה נגמרה בשעה HH:MM"
-        self.last_speaker_paragraph_index = None
-
-        for index in range(len(self.raw_text) - 1, -1, -1):
-            paragraph = self.raw_text[index]
-
-            if google_re2.match(rf"^הישיבה ננעלה", paragraph["text"]):
-                self.last_speaker_paragraph_index = index
-
-        if self.last_speaker_paragraph_index is None:
-            raise ValueError("Did not find last_speaker_paragraph_index!")
-
-    def remove_titles(self):
-        """
-        Removes paragraphs identified as titles from the document's raw text.
-
-        A paragraph is considered a title if it is fully underlined and not identified as a speaker.
-        The method filters out such paragraphs from the `self.raw_text` attribute.
-
-        """
-
-        def __is_title(paragraph) -> bool:
-            """
-            Determines if a given paragraph should be considered a title based on its formatting and content.
-
-            The function checks whether the paragraph is underlined. If so, and if the paragraph is not
-            identified as a speaker - it is considered a title.
-
-            Args:
-                paragraph: The paragraph to be evaluated.
-
-            Returns:
-                bool: True if the paragraph is underlined and not identified as a speaker, indicating it is a title.
-                      False otherwise.
-
-            Example:
-                For example, the title "חשיפת ישראל לסיכונים ביטחוניים-צבאיים" in the document "13_ptm_532025.docx"
-                is fully underlined and is not a speaker - therefore identified as a title by this function.
-            """
-
-            # Only Hebrew / English / Digit / : / " / ' characters
-            paragraph["text"] = google_re2.sub(r"[^א-תa-zA-Z0-9:\"']+", " ", paragraph["text"]).strip()
-
-            # Replace " / ' with empty string
-            paragraph["text"] = google_re2.sub(r"[\"']+", "", paragraph["text"])
-
-            # Replace multiple spaces with a single space
-            paragraph["text"] = google_re2.sub(r"\s+", " ", paragraph["text"])
-
-            is_speaker = google_re2.match(speaker_regex, paragraph["text"].strip())
-
-            return paragraph["is_underlined"] and paragraph["is_first_paragraph_amongst_split_paragraphs"] and not is_speaker
-
-        self.raw_text = [paragraph for paragraph in self.raw_text if not __is_title(paragraph)]
-
-    def extract_speaker_indexes(self):
-        """
-        Extracts the indexes of paragraphs that contain speaker names.
-
-        This method iterates through the raw text and identifies paragraphs that match the speaker pattern,
-        which are typically underlined, marked as the first paragraph among split paragraphs, and contain a name
-        followed by a colon. The indexes of these paragraphs are stored in `self.speaker_indexes`.
-
-        """
-
-        self.speaker_indexes = []
-
-        for index in range(len(self.raw_text)):
-            paragraph = copy.deepcopy(self.raw_text[index])
-
-            # Only Hebrew / English / Digit / : / " / ' characters
-            paragraph["text"] = google_re2.sub(r"[^א-תa-zA-Z0-9:\"']+", " ", paragraph["text"]).strip()
-
-            # Replace " / ' with empty string
-            paragraph["text"] = google_re2.sub(r"[\"']+", "", paragraph["text"])
-
-            # Replace multiple spaces with a single space
-            paragraph["text"] = google_re2.sub(r"\s+", " ", paragraph["text"])
-
-            # If it's underlined and it matches the speaker pattern
-            if (
-                paragraph["is_underlined"]
-                and paragraph["is_first_paragraph_amongst_split_paragraphs"]
-                and google_re2.match(speaker_regex, paragraph["text"])
-            ):
-                self.speaker_indexes.append(index)
-
-    def create_speaker_text_consecutive(self):
-        """
-        Creates a list of consecutive speaker texts.
-
-        This method groups the text spoken by each speaker into a single block by iterating over the speaker indexes
-        and extracting the text between them. The result is stored in `self.speaker_text_consecutive` as a list of
-        dictionaries, each containing the speaker's name and their corresponding text.
-
-        """
-
-        self.speaker_text_consecutive = []
-        for current_speaker_index, next_speaker_index in zip(self.speaker_indexes, (self.speaker_indexes[1:] + [-1])):
-            self.speaker_text_consecutive.append(
-                {
-                    # The last character is always a colon ':'
-                    "speaker_name": self.raw_text[current_speaker_index]["text"][:-1],
-                    "text": " ".join([paragraph["text"] for paragraph in self.raw_text[current_speaker_index + 1 : next_speaker_index]]),
-                }
-            )
-
-    def clean_speaker_names(self):
-        """
-        Cleans and standardizes the speaker names in the protocol.
-
-        This method processes the speaker names by removing unwanted titles (e.g., chairman, parliament member) and
-        unnecessary characters. It then maps the original speaker names to their cleaned versions, updating the
-        `speaker_text_consecutive` list with the standardized names.
-
-        """
-
-        # Get unique speakers
-        original_speakers = {speaker_text["speaker_name"] for speaker_text in self.speaker_text_consecutive}
-
-        # Create a mapping of original speakers to the clean speakers
-        original_to_clean_speakers_mapping = {original_speaker: original_speaker for original_speaker in original_speakers}
-
-        for original_speaker in original_to_clean_speakers_mapping:
-            clean_speaker = original_to_clean_speakers_mapping[original_speaker]
-
-            # Only Hebrew / English / Digit / " / ' characters
-            clean_speaker = google_re2.sub(r"[^א-תa-zA-Z0-9\"']+", " ", clean_speaker).strip()
-
-            # Replace " / ' with empty string
-            clean_speaker = google_re2.sub(r"[\"']+", "", clean_speaker)
-
-            # Replace multiple spaces with a single space
-            clean_speaker = google_re2.sub(r"\s+", " ", clean_speaker)
-
-            # Remove chairman variations
-            # I only want exact matches, I don't want to delete semi-matches, for example: יורמן is a legitimate family name
-            # WARNING: I am purposefully using the O(2^n) default slow re, instead of Google's O(n) re2, re2 does not support lookbehind and lookahead
-            clean_speaker = slow_re.sub(rf"(?<![\u05D0-\u05EA])(?:{'|'.join(chairman_variations)})(?![\u05D0-\u05EA])", "", clean_speaker)
-
-            # Remove parliament member variations
-            # I only want exact matches, I don't want to delete semi-matches, for example: חכים is a legitimate name
-            # WARNING: I am purposefully using the O(2^n) default slow re, instead of Google's O(n) re2, re2 does not support lookbehind and lookahead
-            clean_speaker = slow_re.sub(rf"(?<![\u05D0-\u05EA])(?:{'|'.join(parliament_member_variations)})(?![\u05D0-\u05EA])", "", clean_speaker)
-
-            # TODO: Add removal of minister
-
-            # Strip and put to mapping
-            clean_speaker = clean_speaker.strip()
-            original_to_clean_speakers_mapping[original_speaker] = clean_speaker
-
-        # Map to clean speakers
-        for speaker_text in self.speaker_text_consecutive:
-            speaker_text["speaker_name"] = original_to_clean_speakers_mapping[speaker_text["speaker_name"]]
+            self.raw_text[index]["text"] = re2.sub(r"<<.*?>>", "", self.raw_text[index]["text"]).strip()
 
     def map_speaker_to_person_id(self):
         """
@@ -871,6 +946,11 @@ class KnessetProtocol:
 
         # We create a set of all unique speakers
         speakers = {speaker_text["speaker_name"] for speaker_text in self.speaker_text_consecutive}
+
+        if is_debug:
+            print(Delimiter)
+            print("Distinct Speakers:")
+            pprint(speakers, sort_dicts=False)
 
         # For the metadata, we want to create all possible combinations for non-null
         # For example:
@@ -1127,6 +1207,15 @@ class KnessetProtocol:
             row["speaker_name"]: {"all_person_id_matches": row["all_person_id_matches"], "person_id": row["person_id"]}
             for row in self.metadata.to_dicts()
         }
+
+        if is_debug:
+            print(Delimiter)
+            print("self.speaker_to_person_mapping:")
+            pprint(self.speaker_to_person_mapping, sort_dicts=False)
+
+            print(Delimiter)
+            print("Not in self.speaker_to_person_mapping:")
+            pprint(speakers.difference(set(self.speaker_to_person_mapping.keys())), sort_dicts=False)
 
         # Add the person_id, all_person_id_matches to self.speaker_text_consecutive using self.speaker_to_person_mapping
         self.speaker_text_consecutive = [
