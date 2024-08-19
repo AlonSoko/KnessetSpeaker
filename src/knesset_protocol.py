@@ -1,3 +1,4 @@
+import functools
 import itertools
 import os
 import platform
@@ -290,6 +291,30 @@ speaker_min_words = 2
 SIMILARITY_THRESHOLD = 0.9
 
 
+def supported_system(required_system):
+    """
+    Decorator to ensure that the function is only executed on a specified operating system.
+
+    Args:
+        required_system (str): The name of the required system, e.g., 'Windows', 'Linux', 'Darwin' (for macOS).
+
+    Raises:
+        RuntimeError: If the function is called on an unsupported system.
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            current_system = platform.system()
+            if current_system != required_system:
+                raise RuntimeError(f"Function {func.__name__} can only be run on {required_system}. Current system: {current_system}")
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 class KnessetProtocol:
     def __init__(self, **kwargs):
         """
@@ -526,7 +551,7 @@ class KnessetProtocol:
 
         return int(paragraph.split(" ")[0]) if paragraph.split(" ")[0].isdecimal() else None
 
-    # TODO: Add support for Linux / MacOS
+    @supported_system("Windows")
     def extract_protocol_number_windows(self, word_document):
         """
         Extracts the protocol number from a given Word document.
@@ -643,7 +668,7 @@ class KnessetProtocol:
 
         return False
 
-    # TODO: Add support for Linux / MacOS
+    @supported_system("Windows")
     def get_first_speaker_index_windows(self, word_document):
         """
         Identifies the starting index of the first speaker in the Word document.
@@ -702,7 +727,7 @@ class KnessetProtocol:
         if self.first_speaker_index is None:
             raise ValueError("Could not find first speaker index!")
 
-    # TODO: Add support for Linux / MacOS
+    @supported_system("Windows")
     def get_last_speaker_index_windows(self, word_document):
         """
         Identifies the starting index of the end of the Word document.
@@ -858,7 +883,7 @@ class KnessetProtocol:
 
         return clean_speaker_name
 
-    # TODO: Add support for Linux / MacOS
+    @supported_system("Windows")
     def get_speakers_names_indexes_irrelevant_text_indexes_windows(self, word_document):
         """
         Identifies the names and starting indexes of all speakers, as well as irrelevant text sections, in the Word document.
@@ -959,10 +984,9 @@ class KnessetProtocol:
         if len(self.speaker_names_indexes) == 0:
             raise ValueError("Could not find speaker indexes!")
 
-    def load_document(self, document_path):
+    @supported_system("Windows")
+    def load_document_windows(self, document_path):
         """
-        Loads and processes a Word document, extracting protocol metadata and speaker information.
-
         This method handles the loading of a Word document using the COM object model on Windows. It extracts
         various pieces of metadata such as the protocol type, Knesset number, protocol name, and protocol number.
 
@@ -971,101 +995,119 @@ class KnessetProtocol:
 
         Args:
             document_path (str): The full path to the Word document to be loaded and processed.
+        """
+
+        import win32com.client as win32
+
+        # Initialize COM object
+        word_application = win32.Dispatch("Word.Application")
+        word_application.Visible = False
+
+        # Open the specific document and work with it directly
+        word_document = word_application.Documents.Open(document_path, ReadOnly=True)
+
+        # Extract the protocol metadata
+        self.extract_protocol_type(document_path)
+        self.extract_knesset_number(document_path)
+        self.extract_protocol_name(document_path)
+        self.extract_protocol_number_windows(word_document)
+
+        if is_debug:
+            print(Delimiter)
+            print(f"self.protocol_type: {self.protocol_type}")
+            print(f"self.knesset_number: {self.knesset_number}")
+            print(f"self.protocol_name: {self.protocol_name}")
+            print(f"self.protocol_number: {self.protocol_number}")
+
+        # Get first and last speaker index
+        self.get_first_speaker_index_windows(word_document)
+        self.get_last_speaker_index_windows(word_document)
+
+        if is_debug:
+            print(Delimiter)
+            print(f"self.first_speaker_index: {self.first_speaker_index}")
+            print(f"self.last_speaker_index: {self.last_speaker_index}")
+
+        # Get the speaker_names_indexes and irrelevant_text_indexes
+        self.get_speakers_names_indexes_irrelevant_text_indexes_windows(word_document)
+
+        if is_debug:
+            print(Delimiter)
+            print("self.speaker_names_indexes:")
+            pprint(self.speaker_names_indexes, sort_dicts=False)
+
+            print(Delimiter)
+            print("self.irrelevant_text_indexes")
+            pprint(self.irrelevant_text_indexes, sort_dicts=False)
+
+        # Create a list of consecutive speaker texts
+        self.speaker_text_consecutive = []
+        for current_speaker_name, current_speaker_end_index, next_speaker_start_index in zip(
+            [speaker_name_index["speaker_name"] for speaker_name_index in self.speaker_names_indexes],
+            [speaker_name_index["end_index"] for speaker_name_index in self.speaker_names_indexes],
+            [speaker_name_index["start_index"] for speaker_name_index in self.speaker_names_indexes][1:] + [self.last_speaker_index],
+        ):
+            # We want to see if there's any irrelevant in the way between current_speaker and next_speaker
+            current_speaker_irrelevants = [
+                text_index["start_index"]
+                for text_index in self.irrelevant_text_indexes
+                if (current_speaker_end_index <= text_index["start_index"] < next_speaker_start_index)
+            ]
+
+            if len(current_speaker_irrelevants) > 0:
+                End = min(current_speaker_irrelevants)
+
+            else:
+                End = next_speaker_start_index
+
+            # Get the text from the end of current_speaker, to the start of the next_speaker
+            text = word_document.Range(Start=current_speaker_end_index, End=End).text
+
+            # Replace all of them with space, later on we split to sentences correctly using ntlk
+            text = re2.sub(r"[\n\r\t\v\f]+", " ", text)
+
+            # Replace multiple spaces with a single space
+            text = re2.sub(r"\s+", " ", text)
+
+            text = text.strip()
+
+            self.speaker_text_consecutive.append(
+                {
+                    "speaker_name": current_speaker_name,
+                    "text": text,
+                }
+            )
+
+        if is_debug:
+            print(Delimiter)
+            print(f"self.speaker_text_consecutive[0:10]:")
+            pprint(self.speaker_text_consecutive[0:10], sort_dicts=False)
+
+        # Close the document without saving changes and quit Word application
+        word_document.Close(False)
+        word_application.Quit()
+
+    def load_document(self, document_path):
+        """
+        Loads and processes a Word document, extracting protocol metadata and speaker information.
+
+        Args:
+            document_path (str): The full path to the Word document to be loaded and processed.
 
         Raises:
-            NotImplementedError: If the method is called on a non-Windows platform.
+            NotImplementedError: If the method is called on a not supported platform.
         """
 
         if platform.system() == "Windows":
-            import win32com.client as win32
+            self.load_document_windows(document_path)
 
-            # Initialize COM object
-            word_application = win32.Dispatch("Word.Application")
-            word_application.Visible = False
+        elif platform.system() == "Linux":
+            # TODO: Add suport for Linux
+            raise NotImplementedError(f"Platform {platform.system()} is not supported.")
 
-            # Open the specific document and work with it directly
-            word_document = word_application.Documents.Open(document_path, ReadOnly=True)
-
-            # Extract the protocol metadata
-            self.extract_protocol_type(document_path)
-            self.extract_knesset_number(document_path)
-            self.extract_protocol_name(document_path)
-            self.extract_protocol_number_windows(word_document)
-
-            if is_debug:
-                print(Delimiter)
-                print(f"self.protocol_type: {self.protocol_type}")
-                print(f"self.knesset_number: {self.knesset_number}")
-                print(f"self.protocol_name: {self.protocol_name}")
-                print(f"self.protocol_number: {self.protocol_number}")
-
-            # Get first and last speaker index
-            self.get_first_speaker_index_windows(word_document)
-            self.get_last_speaker_index_windows(word_document)
-
-            if is_debug:
-                print(Delimiter)
-                print(f"self.first_speaker_index: {self.first_speaker_index}")
-                print(f"self.last_speaker_index: {self.last_speaker_index}")
-
-            # Get the speaker_names_indexes and irrelevant_text_indexes
-            self.get_speakers_names_indexes_irrelevant_text_indexes_windows(word_document)
-
-            if is_debug:
-                print(Delimiter)
-                print("self.speaker_names_indexes:")
-                pprint(self.speaker_names_indexes, sort_dicts=False)
-
-                print(Delimiter)
-                print("self.irrelevant_text_indexes")
-                pprint(self.irrelevant_text_indexes, sort_dicts=False)
-
-            # Create a list of consecutive speaker texts
-            self.speaker_text_consecutive = []
-            for current_speaker_name, current_speaker_end_index, next_speaker_start_index in zip(
-                [speaker_name_index["speaker_name"] for speaker_name_index in self.speaker_names_indexes],
-                [speaker_name_index["end_index"] for speaker_name_index in self.speaker_names_indexes],
-                [speaker_name_index["start_index"] for speaker_name_index in self.speaker_names_indexes][1:] + [self.last_speaker_index],
-            ):
-                # We want to see if there's any irrelevant in the way between current_speaker and next_speaker
-                current_speaker_irrelevants = [
-                    text_index["start_index"]
-                    for text_index in self.irrelevant_text_indexes
-                    if (current_speaker_end_index <= text_index["start_index"] < next_speaker_start_index)
-                ]
-
-                if len(current_speaker_irrelevants) > 0:
-                    End = min(current_speaker_irrelevants)
-
-                else:
-                    End = next_speaker_start_index
-
-                # Get the text from the end of current_speaker, to the start of the next_speaker
-                text = word_document.Range(Start=current_speaker_end_index, End=End).text
-
-                # Replace all of them with space, later on we split to sentences correctly using ntlk
-                text = re2.sub(r"[\n\r\t\v\f]+", " ", text)
-
-                # Replace multiple spaces with a single space
-                text = re2.sub(r"\s+", " ", text)
-
-                text = text.strip()
-
-                self.speaker_text_consecutive.append(
-                    {
-                        "speaker_name": current_speaker_name,
-                        "text": text,
-                    }
-                )
-
-            if is_debug:
-                print(Delimiter)
-                print(f"self.speaker_text_consecutive[0:10]:")
-                pprint(self.speaker_text_consecutive[0:10], sort_dicts=False)
-
-            # Close the document without saving changes and quit Word application
-            word_document.Close(False)
-            word_application.Quit()
+        elif platform.system() == "Darwin":
+            # TODO: Add suport for Darwin
+            raise NotImplementedError(f"Platform {platform.system()} is not supported.")
 
         else:
             raise NotImplementedError(f"Platform {platform.system()} is not supported.")
