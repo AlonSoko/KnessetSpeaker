@@ -1332,24 +1332,53 @@ class KnessetProtocol:
         )
 
         # We get the max(similarity_ratio) over a window of speaker_name
-        self.metadata = self.metadata.with_columns([pl.col("similarity_ratio").max().over("speaker_name").alias("max_similarity_ratio")])
-
         # We leave only rows that have max similarity ratio for this speaker
-        self.metadata = self.metadata.filter(pl.col("similarity_ratio") == pl.col("max_similarity_ratio")).drop("similarity_ratio")
+        self.metadata = (
+            self.metadata.with_columns([pl.col("similarity_ratio").max().over("speaker_name").alias("max_similarity_ratio")])
+            .filter(pl.col("similarity_ratio") == pl.col("max_similarity_ratio"))
+            .drop("similarity_ratio", "max_similarity_ratio")
+        )
 
         # We might have collisions, we know there are PM members with identical names.
         #
-        # We collect all person_all_person_id_matchesids to a list, and if a collision has occurred (len(all_person_id_matches) > 1) we alert over it.
+        # We collect all_person_id_matches to a list, so if a collision has occurred (len(all_person_id_matches) > 1) we know it.
         # The chosen person_id will always be the max amongst all_person_id_matches, for 2 reasons:
         # 1. The higher the person_id, the newer he is in the Knesset. Our dataset contains Knessets from 92' and beyond,
         #    So it's reasonable to assume that newer Knesset Members have a better chance of being the ones talking than older ones.
         # 2. Determinism - I want a deterministic approach to choosing the person_id
-        self.metadata = self.metadata.group_by("speaker_name").agg([pl.col("person_id").unique().alias("all_person_id_matches")])
-        self.metadata = self.metadata.with_columns([pl.col("all_person_id_matches").list.max().alias("person_id")])
+
+        grouped_metadata = self.metadata.group_by("speaker_name").agg(
+            [
+                pl.col("person_id").unique().alias("all_person_id_matches"),
+                pl.col("person_id").max().alias("person_id"),
+            ],
+        )
+
+        self.metadata = grouped_metadata.join(self.metadata, on=["speaker_name", "person_id"], how="inner").select(
+            ["speaker_name", "all_person_id_matches", "person_id", (pl.col("first_name") + " " + pl.col("last_name")).alias("person_name")]
+        )
+
+        # We might have multiple first_name, last_name combinations for the same person_id - This is because we tried all of them
+        # 1. We first want to take the ones with the maximum length over speaker_name, person_id window
+        self.metadata = (
+            self.metadata.with_columns([pl.col("person_name").str.len_chars().max().over("speaker_name", "person_id").alias("max_len")])
+            .filter(pl.col("person_name").str.len_chars() == pl.col("max_len"))
+            .drop("max_len")
+        )
+        # 2. In case we have collisions in length, we take the one which is maximum lexicographically
+        self.metadata = (
+            self.metadata.with_columns([pl.col("person_name").max().over("speaker_name", "person_id").alias("max_person_name")])
+            .filter(pl.col("person_name") == pl.col("max_person_name"))
+            .drop("max_person_name")
+        )
 
         # Convert the dataframe to a dictionary mapping
         self.speaker_to_person_mapping = {
-            row["speaker_name"]: {"all_person_id_matches": row["all_person_id_matches"], "person_id": row["person_id"]}
+            row["speaker_name"]: {
+                "all_person_id_matches": row["all_person_id_matches"],
+                "person_id": row["person_id"],
+                "person_name": row["person_name"],
+            }
             for row in self.metadata.to_dicts()
         }
 
@@ -1362,12 +1391,10 @@ class KnessetProtocol:
             print("Not in self.speaker_to_person_mapping:")
             pprint(speakers.difference(set(self.speaker_to_person_mapping.keys())), sort_dicts=False)
 
-        # TODO: Replace with mapping
-
-        # Add the person_id, all_person_id_matches to self.speaker_text_consecutive using self.speaker_to_person_mapping
+        # Replace the speaker_name with person_name, and add person_id, all_person_id_matches to self.speaker_text_consecutive
         self.speaker_text_consecutive = [
             {
-                "speaker_name": speaker_text["speaker_name"],
+                "speaker_name": self.speaker_to_person_mapping.get(speaker_text["speaker_name"], {}).get("person_name"),
                 "person_id": self.speaker_to_person_mapping.get(speaker_text["speaker_name"], {}).get("person_id"),
                 "all_person_id_matches": self.speaker_to_person_mapping.get(speaker_text["speaker_name"], {}).get("all_person_id_matches"),
                 "text": speaker_text["text"],
