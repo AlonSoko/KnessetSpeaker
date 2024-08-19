@@ -1070,20 +1070,6 @@ class KnessetProtocol:
         else:
             raise NotImplementedError(f"Platform {platform.system()} is not supported.")
 
-    # TODO: Check if neccesary
-    def remove_tags(self):
-        """
-        Removes tags from the raw text of the document.
-
-        This method iterates through all paragraphs of the raw text and removes any tags enclosed in double angle brackets,
-        e.g., "<<tag>>". The cleaned text replaces the original text in each paragraph.
-
-        """
-
-        # Remove the tags from the text
-        for index in range(len(self.raw_text)):
-            self.raw_text[index]["text"] = re2.sub(r"<<.*?>>", "", self.raw_text[index]["text"]).strip()
-
     def map_speaker_to_person_id(self):
         """
         Maps speaker names to person IDs based on their similarity in a dataset.
