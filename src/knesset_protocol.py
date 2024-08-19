@@ -1421,7 +1421,7 @@ class KnessetProtocol:
         # Replace the speaker_name with person_name, and add person_id, all_person_id_matches to self.speaker_text_consecutive
         self.speaker_text_consecutive = [
             {
-                "speaker_name": self.speaker_to_person_mapping.get(speaker_text["speaker_name"], {}).get("person_name"),
+                "speaker_name": self.speaker_to_person_mapping.get(speaker_text["speaker_name"], {}).get("person_name", speaker_text["speaker_name"]),
                 "person_id": self.speaker_to_person_mapping.get(speaker_text["speaker_name"], {}).get("person_id"),
                 "all_person_id_matches": self.speaker_to_person_mapping.get(speaker_text["speaker_name"], {}).get("all_person_id_matches"),
                 "text": speaker_text["text"],
