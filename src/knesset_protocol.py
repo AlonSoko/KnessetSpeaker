@@ -697,7 +697,9 @@ class KnessetProtocol:
         # 3. If it's in the middle of the name
         clean_speaker_name = re2.sub(rf"\s+(?:{'|'.join(parliament_member_variations)})\s+", "", clean_speaker_name)
 
-        # TODO: Add removal of minister
+        # TODO: Add removal of minister - השר לביטחון פנים, שרת החינוך והספורט, etc...
+
+        # TODO: Add removal of prime minister - ראש הממשלה, רוה"מ, etc...
 
         clean_speaker_name = clean_speaker_name.strip()
 
