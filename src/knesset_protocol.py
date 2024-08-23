@@ -2,6 +2,10 @@ import functools
 import itertools
 import os
 import platform
+import signal
+import socket
+import subprocess
+import time
 from difflib import SequenceMatcher
 from pprint import pprint
 from typing import List
@@ -13,10 +17,14 @@ import pyarrow.dataset as ds
 import re2
 from nltk.tokenize import PunktSentenceTokenizer
 
+# Microsoft Word
 wdAlignParagraphLeft = 0
 wdAlignParagraphCenter = 1
 wdAlignParagraphRight = 2
 wdAlignParagraphJustify = 3
+
+# LibreOffice
+center_align_value = 3  # com.sun.star.style.ParagraphAdjust.CENTER
 
 Delimiter = "*" + (100 * "-") + "*"
 
@@ -359,10 +367,20 @@ class KnessetProtocol:
             filters = kwargs["filters"]
 
             # Define the schema explicitly (this should match the schema used when writing)
-            schema = pa.schema([("protocol_type", pa.string()), ("knesset_number", pa.int64()), ("protocol_number", pa.int64())])
+            schema = pa.schema(
+                [
+                    ("protocol_type", pa.string()),
+                    ("knesset_number", pa.int64()),
+                    ("protocol_number", pa.int64()),
+                ]
+            )
 
             # Read the dataset using PyArrow with Hive partitioning
-            dataset = ds.dataset(source=processed_data_path, format="parquet", partitioning=ds.HivePartitioning(schema=schema))
+            dataset = ds.dataset(
+                source=processed_data_path,
+                format="parquet",
+                partitioning=ds.HivePartitioning(schema=schema),
+            )
 
             # Create an expression using PyArrow's compute module
             filter_expr = None
@@ -575,6 +593,9 @@ class KnessetProtocol:
 
         keywords = ["הישיבה", "פרוטוקול מס"]
 
+        # Combine keywords into a single regex pattern
+        keywords_pattern = r"|".join(re2.escape(keyword) for keyword in keywords)
+
         # Set up for each keyword their keyword_search_range
         keyword_search_ranges = []
         for keyword in ["הישיבה", "פרוטוקול מס"]:
@@ -606,14 +627,20 @@ class KnessetProtocol:
                 break
 
             # We want to find the argmin - the keyword_search_engine that found the earliest matching word
-            min_keyword_search_range = min(keyword_search_ranges, key=lambda keyword_search_range: keyword_search_range.Start)
+            min_keyword_search_range = min(
+                keyword_search_ranges,
+                key=lambda keyword_search_range: keyword_search_range.Start,
+            )
 
             # Extend the range to the end of the paragraph
-            paragraph_end_range = word_document.Range(Start=min_keyword_search_range.Start, End=min_keyword_search_range.Paragraphs(1).Range.End)
+            paragraph_end_range = word_document.Range(
+                Start=min_keyword_search_range.Start,
+                End=min_keyword_search_range.Paragraphs(1).Range.End,
+            )
             full_paragraph_text = paragraph_end_range.Text
 
             # We split by the keyword, and we want the sentence immediately after it
-            potential_protocol_number = re2.split(r"|".join(keywords), full_paragraph_text)[1]
+            potential_protocol_number = re2.split(keywords_pattern, full_paragraph_text)[1]
 
             # 1. We attempt to parse a Hebrew number
             self.protocol_number = KnessetProtocol.parse_hebrew_number(potential_protocol_number)
@@ -628,6 +655,72 @@ class KnessetProtocol:
 
             # Move the range start to the end of the last found item to continue searching
             keyword_search_range.SetRange(min_keyword_search_range.End, word_document.Content.End)
+
+        if self.protocol_number is None:
+            raise ValueError("Could not parse protocol number!")
+
+    @supported_system("Linux")
+    def extract_protocol_number_linux(self, word_document):
+        """
+        Extracts the protocol number from a given LibreOffice Writer document in a Linux environment.
+
+        This method searches for specific keywords within the document to locate the protocol number.
+        It identifies the paragraph containing the keyword and attempts to parse the protocol number
+        immediately following the keyword. The protocol number can be in Hebrew or numeric format.
+
+        The method iteratively searches through the document using search descriptors for each keyword.
+        Once a match is found, it processes the corresponding text range to extract the protocol number.
+        The search continues until a valid protocol number is found or all search descriptors have been exhausted.
+
+        Args:
+            word_document: A LibreOffice Writer document object representing the document to be searched.
+
+        Raises:
+            ValueError: If no protocol number can be parsed from the document.
+
+        """
+
+        # Initialize protocol number to None
+        self.protocol_number = None
+
+        keywords = ["הישיבה", "פרוטוקול מס"]
+
+        # Combine keywords into a single regex pattern
+        keywords_pattern = r"|".join(re2.escape(keyword) for keyword in keywords)
+
+        # Create a search descriptor
+        search_descriptor = word_document.createSearchDescriptor()
+        search_descriptor.SearchString = keywords_pattern
+
+        # Enable regular expression search
+        search_descriptor.SearchRegularExpression = True
+
+        # Start the search from the beginning of the document
+        found_range = word_document.findFirst(search_descriptor)
+
+        while found_range:
+            # Extract the paragraph text containing the match
+            paragraph = word_document.Text.createTextCursorByRange(found_range)
+
+            # Ensure the cursor spans the entire paragraph
+            paragraph.gotoStartOfParagraph(False)  # Move to the start of the paragraph
+            paragraph.gotoEndOfParagraph(True)  # Select to the end of the paragraph
+
+            full_paragraph_text = paragraph.getString()
+
+            # We split by the keyword, and we want the sentence immediately after it
+            potential_protocol_number = re2.split(keywords_pattern, full_paragraph_text)[1]
+
+            # 1. We attempt to parse a Hebrew number
+            self.protocol_number = KnessetProtocol.parse_hebrew_number(potential_protocol_number)
+
+            # 2. Attempt to parse a digit number
+            if self.protocol_number is None:
+                self.protocol_number = KnessetProtocol.parse_digit_number(potential_protocol_number)
+
+            # If we found a number from any of the methods, we don't have to search any more
+            if self.protocol_number is not None:
+                break
 
         if self.protocol_number is None:
             raise ValueError("Could not parse protocol number!")
@@ -703,7 +796,10 @@ class KnessetProtocol:
 
             else:
                 # Get the character just before the underline text
-                prev_char_range = word_document.Range(Start=chairman_search_range.Start - 1, End=chairman_search_range.Start)
+                prev_char_range = word_document.Range(
+                    Start=chairman_search_range.Start - 1,
+                    End=chairman_search_range.Start,
+                )
 
                 # If if it's a newline, it means this underline text is the start of a paragraph
                 is_paragraph_start = prev_char_range.Text in ["\r", "\n"]
@@ -720,9 +816,101 @@ class KnessetProtocol:
 
             is_centered = chairman_search_range.ParagraphFormat.Alignment == wdAlignParagraphCenter
 
-            if KnessetProtocol.is_chairman(is_underline=True, is_centered=is_centered, is_paragraph_start=is_paragraph_start, text=underline_text):
+            if KnessetProtocol.is_chairman(
+                is_underline=True,
+                is_centered=is_centered,
+                is_paragraph_start=is_paragraph_start,
+                text=underline_text,
+            ):
                 self.first_speaker_index = chairman_search_range.Start
                 break
+
+        if self.first_speaker_index is None:
+            raise ValueError("Could not find first speaker index!")
+
+    @supported_system("Linux")
+    def get_first_speaker_index_linux(self, word_document):
+        """
+        Identifies the starting index of the first speaker in the LibreOffice Writer word_document.
+
+        The assumption is that the first speaker is always the Knesset chairman (יו"ר).
+
+        Args:
+            word_document: A LibreOffice Writer word_document object to be searched.
+        """
+
+        import uno
+
+        # Initialize first speaker index to None
+        self.first_speaker_index = None
+
+        # Set up the search descriptor for underlined text
+        search_descriptor = word_document.createSearchDescriptor()
+        search_descriptor.SearchRegularExpression = False
+        search_descriptor.SearchCaseSensitive = False
+        search_descriptor.SearchStyles = True  # Include styles in the search
+
+        # Set the search descriptor to look for underlined text (1 corresponds to single underline)
+        search_attributes = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
+        search_attributes.Name = "CharUnderline"
+        search_attributes.Value = 1  # 1 represents single underline
+
+        search_descriptor.setSearchAttributes([search_attributes])
+
+        # Initialize the search
+        found_range = word_document.findFirst(search_descriptor)
+
+        while found_range:
+            # Get the underline text
+            underline_text = found_range.getString()
+
+            # Check if it's at the start of a paragraph
+            is_paragraph_start = False
+
+            # Check if the range is at the very start of the word_document
+            if found_range.getStart() == word_document.Text.getStart():
+                is_paragraph_start = True
+            else:
+                # Get the character just before the underline text
+                prev_char_range = word_document.Text.createTextCursor()
+                prev_char_range.gotoRange(found_range.getStart(), False)  # Move to the start of the found range
+                prev_char_range.goLeft(1, True)  # Move left by one character, selecting it
+                prev_char = prev_char_range.getString()  # Get the previous character as a string
+
+                # If it's a newline, it means this underlined text is the start of a paragraph
+                is_paragraph_start = prev_char in ["\r", "\n"]
+
+            # If the underline text is not at the very end of the word_document, we want to check the character after it
+            if word_document.Text.compareRegionEnds(found_range, word_document.Text) == -1:
+                # Get the character just after the underline text
+                next_char_range = word_document.Text.createTextCursor()
+                next_char_range.gotoRange(found_range.getEnd(), False)  # Move to the end of the found range
+                next_char_range.goRight(1, True)  # Move right by one character, selecting it
+                next_char = next_char_range.getString()  # Get the next character as a string
+
+                # If it's a colon, append it to the underlined text
+                if next_char == ":":
+                    underline_text += ":"
+
+            # Check if the paragraph is centered
+            is_centered = found_range.ParaAdjust == center_align_value
+
+            # Check if this underlined text corresponds to the Knesset chairman
+            if KnessetProtocol.is_chairman(
+                is_underline=True,
+                is_centered=is_centered,
+                is_paragraph_start=is_paragraph_start,
+                text=underline_text,
+            ):
+                self.first_speaker_index = found_range.getStart()
+
+                if is_debug:
+                    print(f"self.first_speaker_index.getString(): {underline_text}")
+
+                break
+
+            # Move to the next match
+            found_range = word_document.findNext(found_range.End, search_descriptor)
 
         if self.first_speaker_index is None:
             raise ValueError("Could not find first speaker index!")
@@ -760,7 +948,10 @@ class KnessetProtocol:
 
             else:
                 # Get the character just before the meeting_end text
-                prev_char_range = word_document.Range(Start=meeting_end_search_range.Start - 1, End=meeting_end_search_range.Start)
+                prev_char_range = word_document.Range(
+                    Start=meeting_end_search_range.Start - 1,
+                    End=meeting_end_search_range.Start,
+                )
 
                 # If if it's a newline, it means this meeting_end text is the start of a paragraph
                 is_paragraph_start = prev_char_range.Text in ["\r", "\n"]
@@ -768,6 +959,66 @@ class KnessetProtocol:
             if is_paragraph_start:
                 self.last_speaker_index = meeting_end_search_range.Start
                 break
+
+        if self.last_speaker_index is None:
+            raise ValueError("Could not find last speaker index!")
+
+    @supported_system("Linux")
+    def get_last_speaker_index_linux(self, word_document):
+        """
+        Identifies the starting index of the end of the LibreOffice Writer word_document.
+
+        The assumption is that whether a committee or a plenary, it always ends with "הישיבה נגמרה בשעה HH:MM".
+
+        Args:
+            word_document: A LibreOffice Writer word_document object to be searched.
+        """
+
+        # Initialize last speaker index to None
+        self.last_speaker_index = None
+
+        # Set up the search descriptor for the "הישיבה ננעלה" text
+        search_descriptor = word_document.createSearchDescriptor()
+        search_descriptor.SearchString = "הישיבה ננעלה"
+        search_descriptor.SearchBackwards = True  # Search from the bottom up
+
+        # Position the cursor at the end of the document
+        search_range = word_document.Text.createTextCursor()
+        search_range.gotoEnd(False)  # Start from the end
+
+        # Perform the search
+        found_range = word_document.findNext(search_range, search_descriptor)
+
+        while found_range:
+            # Get the text
+            text = found_range.getString()
+
+            # Check if the text is at the start of a paragraph
+            is_paragraph_start = False
+
+            # Check if the range is at the very start of the word_document
+            if found_range.getStart() == word_document.Text.getStart():
+                is_paragraph_start = True
+            else:
+                # Get the character just before the underline text
+                prev_char_range = word_document.Text.createTextCursor()
+                prev_char_range.gotoRange(found_range.getStart(), False)  # Move to the start of the found range
+                prev_char_range.goLeft(1, True)  # Move left by one character, selecting it
+                prev_char = prev_char_range.getString()  # Get the previous character as a string
+
+                # If it's a newline, it means this underlined text is the start of a paragraph
+                is_paragraph_start = prev_char in ["\r", "\n"]
+
+            if is_paragraph_start:
+                self.last_speaker_index = found_range.getStart()
+
+                if is_debug:
+                    print(f"self.last_speaker_index.getString(): {text}")
+
+                break
+
+            # Move to the next match
+            found_range = word_document.findNext(found_range.End, search_descriptor)
 
         if self.last_speaker_index is None:
             raise ValueError("Could not find last speaker index!")
@@ -850,7 +1101,11 @@ class KnessetProtocol:
         # 2. If it's in the end of the name
         clean_speaker_name = re2.sub(rf"\s+(?:{'|'.join(parliament_member_variations)})$", "", clean_speaker_name)
         # 3. If it's in the middle of the name
-        clean_speaker_name = re2.sub(rf"\s+(?:{'|'.join(parliament_member_variations)})\s+", "", clean_speaker_name)
+        clean_speaker_name = re2.sub(
+            rf"\s+(?:{'|'.join(parliament_member_variations)})\s+",
+            "",
+            clean_speaker_name,
+        )
 
         # Remove minister variations
         # I only want exact matches, I don't want to delete semi-matches, for example: שרה is a legitimate name
@@ -862,11 +1117,23 @@ class KnessetProtocol:
         minister_offices_pattern = rf"(?:\s*[ו|ה|ל]*(?:{'|'.join(minister_offices)}))"
 
         # 1. If it's in the beginning of the name
-        clean_speaker_name = re2.sub(rf"^{minister_variations_pattern}\s+{minister_offices_pattern}+\s+", "", clean_speaker_name)
+        clean_speaker_name = re2.sub(
+            rf"^{minister_variations_pattern}\s+{minister_offices_pattern}+\s+",
+            "",
+            clean_speaker_name,
+        )
         # 2. If it's in the end of the name
-        clean_speaker_name = re2.sub(rf"\s+{minister_variations_pattern}\s+{minister_offices_pattern}+$", "", clean_speaker_name)
+        clean_speaker_name = re2.sub(
+            rf"\s+{minister_variations_pattern}\s+{minister_offices_pattern}+$",
+            "",
+            clean_speaker_name,
+        )
         # 3. If it's in the middle of the name
-        clean_speaker_name = re2.sub(rf"\s+{minister_variations_pattern}\s+{minister_offices_pattern}+\s+", "", clean_speaker_name)
+        clean_speaker_name = re2.sub(
+            rf"\s+{minister_variations_pattern}\s+{minister_offices_pattern}+\s+",
+            "",
+            clean_speaker_name,
+        )
 
         # Remove prime minister variations
         # I only want exact matches, I don't want to delete semi-matches, for example: רוהמאן is a legitimate name
@@ -953,7 +1220,12 @@ class KnessetProtocol:
             # Check if the text is centered
             is_centered = speaker_search_range.ParagraphFormat.Alignment == wdAlignParagraphCenter
 
-            if KnessetProtocol.is_speaker(is_underline=True, is_centered=is_centered, is_paragraph_start=is_paragraph_start, text=underline_text):
+            if KnessetProtocol.is_speaker(
+                is_underline=True,
+                is_centered=is_centered,
+                is_paragraph_start=is_paragraph_start,
+                text=underline_text,
+            ):
                 self.speaker_names_indexes.append(
                     {
                         "speaker_name": KnessetProtocol.clean_speaker_name(underline_text),
@@ -980,6 +1252,128 @@ class KnessetProtocol:
                             "start_index": speaker_search_range.Start,
                         }
                     )
+
+        if len(self.speaker_names_indexes) == 0:
+            raise ValueError("Could not find speaker indexes!")
+
+    @supported_system("Linux")
+    def get_speakers_names_indexes_irrelevant_text_indexes_linux(self, word_document):
+        """
+        Identifies the names and starting indexes of all speakers, as well as irrelevant text sections, in the LibreOffice word_document.
+
+        This method searches for underlined text within the specified range of the word_document
+        (from `first_speaker_index` to `last_speaker_index`) to identify the names of speakers.
+        It checks if the underlined text is at the start of a paragraph and is centered,
+        appending the information to the `speaker_names_indexes` list if the text is identified as a speaker's name.
+
+        Additionally, it identifies irrelevant text sections, such as titles or occurrences of the words
+        "קריאה" or "קריאות", and appends these to the `irrelevant_text_indexes` list.
+
+        Args:
+            word_document: A LibreOffice Writer word_document object to be searched.
+
+        Raises:
+            ValueError: If no speaker indexes can be found in the specified range of the word_document.
+        """
+
+        import uno
+
+        # Initialize speaker_names_indexes and irrelevant indexes
+        self.speaker_names_indexes = []
+        self.irrelevant_text_indexes = []  # Titles and קריאה or קריאות
+
+        # Set up the search descriptor for underlined text
+        search_descriptor = word_document.createSearchDescriptor()
+        search_descriptor.SearchRegularExpression = False
+        search_descriptor.SearchCaseSensitive = False
+        search_descriptor.SearchStyles = True  # Include styles in the search
+
+        # Set the search descriptor to look for underlined text (1 corresponds to single underline)
+        search_attributes = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
+        search_attributes.Name = "CharUnderline"
+        search_attributes.Value = 1  # 1 represents single underline
+
+        search_descriptor.setSearchAttributes([search_attributes])
+
+        # Perform the search within the specified range
+        found_range = word_document.findFirst(search_descriptor)
+
+        while found_range:
+            # If found_range starts with or after the last_speaker_index, we break
+            if word_document.Text.compareRegionStarts(found_range, self.last_speaker_index) <= 0:
+                break
+
+            # Only if the found range starts with or after the first_speaker_index, we consider it
+            if word_document.Text.compareRegionStarts(found_range, self.first_speaker_index) <= 0:
+                # Get the underline text
+                underline_text = found_range.getString()
+
+                # Check if it's at the start of a paragraph
+                is_paragraph_start = False
+
+                # Check if the range is at the very start of the word_document
+                if found_range.getStart() == self.first_speaker_index:
+                    is_paragraph_start = True
+                else:
+                    # Get the character just before the underline text
+                    prev_char_range = word_document.Text.createTextCursor()
+                    prev_char_range.gotoRange(found_range.getStart(), False)  # Move to the start of the found range
+                    prev_char_range.goLeft(1, True)  # Move left by one character, selecting it
+                    prev_char = prev_char_range.getString()  # Get the previous character as a string
+
+                    # If it's a newline, it means this underlined text is the start of a paragraph
+                    is_paragraph_start = prev_char in ["\r", "\n"]
+
+                # If the underline text is not at the very end of the word_document, we want to check the character after it
+                if word_document.Text.compareRegionEnds(found_range, self.last_speaker_index) == -1:
+                    # Get the character just after the underline text
+                    next_char_range = word_document.Text.createTextCursor()
+                    next_char_range.gotoRange(found_range.getEnd(), False)  # Move to the end of the found range
+                    next_char_range.goRight(1, True)  # Move right by one character, selecting it
+                    next_char = next_char_range.getString()  # Get the next character as a string
+
+                    # If it's a colon, append it to the underlined text
+                    if next_char == ":":
+                        underline_text += ":"
+
+                # Check if the paragraph is centered
+                is_centered = found_range.ParaAdjust == center_align_value
+
+                if KnessetProtocol.is_speaker(
+                    is_underline=True,
+                    is_centered=is_centered,
+                    is_paragraph_start=is_paragraph_start,
+                    text=underline_text,
+                ):
+                    self.speaker_names_indexes.append(
+                        {
+                            "speaker_name": KnessetProtocol.clean_speaker_name(underline_text),
+                            "start_index": found_range.getStart(),
+                            "end_index": found_range.getEnd(),
+                        }
+                    )
+
+                # If it's underlined (We know it is, we are searching for it), and it's a paragraph start, but it's not a speaker, it could be one of 3 options:
+                # 1. Titles - for example: הצעות סיעות שינוי, האיחוד הלאומי  – ישראל ביתנו – in 16_ptm_129044.docx
+                # 2. קריאה or קריאות
+                #
+                # 3. It's a string that contains something like \r\n\t etc...
+                #
+                # If it's the 3rd case, we want to ignore it.
+                # If it's the first two cases - we want ot add it to irrelevant text indexes, so we know to skip it when parsing consecutive texts
+
+                elif is_paragraph_start:
+                    # If it's a string consisting of only new lines / tabs / etc... we want to ignore it for irrelevants, no reason to stop at it
+                    if len(re2.sub(r"[\n\r\t\v\f]+", "", underline_text)) > 0:
+                        self.irrelevant_text_indexes.append(
+                            {
+                                "text": re2.sub(r"[\t\v\f]+", "", underline_text.strip()),  # This is just so it looks nice in the debug print
+                                "start_index": found_range.getStart(),
+                            }
+                        )
+
+            # Move to the next match
+            found_range = word_document.findNext(found_range.End, search_descriptor)
 
         if len(self.speaker_names_indexes) == 0:
             raise ValueError("Could not find speaker indexes!")
@@ -1042,7 +1436,11 @@ class KnessetProtocol:
 
         # Create a list of consecutive speaker texts
         self.speaker_text_consecutive = []
-        for current_speaker_name, current_speaker_end_index, next_speaker_start_index in zip(
+        for (
+            current_speaker_name,
+            current_speaker_end_index,
+            next_speaker_start_index,
+        ) in zip(
             [speaker_name_index["speaker_name"] for speaker_name_index in self.speaker_names_indexes],
             [speaker_name_index["end_index"] for speaker_name_index in self.speaker_names_indexes],
             [speaker_name_index["start_index"] for speaker_name_index in self.speaker_names_indexes][1:] + [self.last_speaker_index],
@@ -1087,6 +1485,293 @@ class KnessetProtocol:
         word_document.Close(False)
         word_application.Quit()
 
+    @staticmethod
+    @supported_system("Linux")
+    def check_libreoffice_installed():
+        """
+        Checks if LibreOffice is installed on the system by attempting to locate its executable.
+
+        Raises:
+            Exception: If LibreOffice is not installed on the system or if an error occurs during the check.
+        """
+
+        try:
+            # Attempt to locate the LibreOffice executable
+            result = subprocess.run(
+                ["which", "libreoffice"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            if result.returncode != 0 or not result.stdout.strip():
+                # If 'which' command fails or returns an empty string, LibreOffice is not installed
+                raise RuntimeError("LibreOffice is not installed on this system.")
+
+        except subprocess.SubprocessError as e:
+            # Handle any subprocess-related errors
+            raise RuntimeError("An error occurred while checking for LibreOffice installation: " + str(e))
+
+    @staticmethod
+    @supported_system("Linux")
+    def ensure_libreoffice_headless() -> bool:
+        """
+        Checks if LibreOffice is running in headless mode and listening on port 2002.
+        If not, starts LibreOffice in headless mode with the required parameters.
+
+        Raises:
+            Exception: If an error occurs while starting LibreOffice in headless mode.
+
+        Returns:
+            bool - was LibreOffice headless open before
+        """
+
+        def __is_port_open(host, port):
+            """
+            Check if a given port on the specified host is open.
+
+            Args:
+                host (str): The hostname or IP address.
+                port (int): The port number to check.
+
+            Returns:
+                bool: True if the port is open, False otherwise.
+            """
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1)  # Set timeout for the connection attempt
+                result = sock.connect_ex((host, port))
+                return result == 0
+
+        was_libreoffice_headless_open_before = False
+
+        try:
+            # Check if LibreOffice is listening on port 2002
+            if not __is_port_open("127.0.0.1", 2002):
+                # If not, start LibreOffice in headless mode
+                subprocess.Popen(
+                    [
+                        "soffice",
+                        "--headless",
+                        "--accept=socket,host=localhost,port=2002;urp;",
+                        "--nofirststartwizard",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                # Wait for a moment to allow LibreOffice to start
+                time.sleep(2)
+
+                # Check again if LibreOffice started successfully
+                if not __is_port_open("127.0.0.1", 2002):
+                    raise RuntimeError("Failed to start LibreOffice in headless mode.")
+            else:
+                was_libreoffice_headless_open_before = True
+
+        except Exception as e:
+            raise RuntimeError(f"An error occurred while ensuring LibreOffice is running in headless mode: {e}")
+
+        return was_libreoffice_headless_open_before
+
+    @staticmethod
+    @supported_system("Linux")
+    def kill_libreoffice_headless():
+        """
+        Terminates the LibreOffice headless process if it is running.
+
+        Raises:
+            RuntimeError: If an error occurs while attempting to kill the LibreOffice headless process.
+        """
+        try:
+            # Find the process ID (PID) of the LibreOffice headless process
+            result = subprocess.run(["pgrep", "-f", "soffice.*--headless"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            # If there is a process found, kill it
+            if result.stdout.strip():
+                pid = int(result.stdout.strip())
+                os.kill(pid, signal.SIGTERM)
+
+                # Optionally, wait for the process to be terminated
+                time.sleep(1)
+
+                # Check if the process is still running
+                if subprocess.run(["ps", "-p", str(pid)], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode == 0:
+                    raise RuntimeError("Failed to terminate the LibreOffice headless process.")
+
+            else:
+                raise RuntimeError("LibreOffice headless is not running or could not be found.")
+
+        except Exception as e:
+            raise RuntimeError(f"An error occurred while attempting to kill the LibreOffice headless process: {e}")
+
+    @supported_system("Linux")
+    def load_document_linux(self, document_path):
+        """
+        This method handles the loading of a LibreOffice Writer document on Linux. It extracts various pieces
+        of metadata such as the protocol type, Knesset number, protocol name, and protocol number.
+
+        The method also identifies the indexes of the first and last speakers in the document, collects speaker
+        names and irrelevant text indexes, and compiles a list of consecutive speaker texts.
+
+        Args:
+            document_path (str): The full path to the LibreOffice Writer document to be loaded and processed.
+        """
+
+        import uno
+        from com.sun.star.beans import PropertyValue
+
+        KnessetProtocol.check_libreoffice_installed()
+        was_libreoffice_headless_open_before = KnessetProtocol.ensure_libreoffice_headless()
+
+        # Initialize the UNO component context
+        local_context = uno.getComponentContext()
+
+        # Create the UNO service manager
+        resolver = local_context.ServiceManager.createInstanceWithContext("com.sun.star.bridge.UnoUrlResolver", local_context)
+
+        # Connect to the LibreOffice instance
+        context = resolver.resolve("uno:socket,host=localhost,port=2002;urp;StarOffice.ComponentContext")
+
+        # Get the desktop (a global object for the office application)
+        desktop = context.ServiceManager.createInstanceWithContext("com.sun.star.frame.Desktop", context)
+
+        # Prepare the arguments for opening the document
+        open_props = (PropertyValue("Hidden", 0, True, 0),)
+
+        # Load the document
+        word_document = desktop.loadComponentFromURL("file:///" + document_path.replace("\\", "/"), "_blank", 0, open_props)
+
+        # Extract the protocol metadata
+        self.extract_protocol_type(document_path)
+        self.extract_knesset_number(document_path)
+        self.extract_protocol_name(document_path)
+        self.extract_protocol_number_linux(word_document)
+
+        if is_debug:
+            print(Delimiter)
+            print(f"self.protocol_type: {self.protocol_type}")
+            print(f"self.knesset_number: {self.knesset_number}")
+            print(f"self.protocol_name: {self.protocol_name}")
+            print(f"self.protocol_number: {self.protocol_number}")
+            print(Delimiter)
+
+        # Get first and last speaker index
+        self.get_first_speaker_index_linux(word_document)
+        self.get_last_speaker_index_linux(word_document)
+
+        # Get the speaker_names_indexes and irrelevant_text_indexes
+        self.get_speakers_names_indexes_irrelevant_text_indexes_linux(word_document)
+
+        if is_debug:
+            print(Delimiter)
+            print('self.speaker_names_indexes["speaker_name"]')
+            pprint([speaker_name_index["speaker_name"] for speaker_name_index in self.speaker_names_indexes], sort_dicts=False)
+
+            print(Delimiter)
+            print('self.irrelevant_text_indexes["text"]')
+            pprint([irrelevant_text_index["text"] for irrelevant_text_index in self.irrelevant_text_indexes], sort_dicts=False)
+
+        def __get_min_text_range(word_document, text_ranges: list):
+            """
+            Determines the earliest text range in a list of text ranges within a LibreOffice Writer document.
+
+            This method compares each text range with all others to determine which range has the majority of other ranges
+            starting after it. The range with the highest score is considered the earliest (i.e., it starts first relative to the others).
+
+            Args:
+                word_document: The LibreOffice Writer document object.
+                text_ranges (list): A list of XTextRange objects to be compared.
+
+            Returns:
+                XTextRange: The text range that is determined to be the earliest based on the scoring method.
+            """
+
+            if len(text_ranges) == 0:
+                return None
+
+            if len(text_ranges) == 1:
+                return text_ranges[0]
+
+            # Initialize scores
+            scores = {text_range: 0 for text_range in text_ranges}
+
+            # Compare each text range with the others
+            for i in range(len(text_ranges)):
+                for j in range(len(text_ranges)):
+                    if i != j:
+                        # If text_ranges[i] starts before text_ranges[j], increment the score for text_ranges[i]
+                        if word_document.Text.compareRegionStarts(text_ranges[i], text_ranges[j]) == 1:
+                            scores[text_ranges[i]] += 1
+
+            # Find the text range with the maximum score (indicating it starts before most others)
+            min_text_range = max(scores, key=scores.get)
+
+            return min_text_range
+
+        # Create a list of consecutive speaker texts
+        self.speaker_text_consecutive = []
+        for (
+            current_speaker_name,
+            current_speaker_end_index,
+            next_speaker_start_index,
+        ) in zip(
+            [speaker_name_index["speaker_name"] for speaker_name_index in self.speaker_names_indexes],
+            [speaker_name_index["end_index"] for speaker_name_index in self.speaker_names_indexes],
+            [speaker_name_index["start_index"] for speaker_name_index in self.speaker_names_indexes][1:] + [self.last_speaker_index],
+        ):
+            # We want to see if there's any irrelevant in the way between current_speaker and next_speaker
+            current_speaker_irrelevants = [
+                text_index["start_index"]
+                for text_index in self.irrelevant_text_indexes
+                if (
+                    # If start_index starts with or after current_speaker_end_index
+                    word_document.Text.compareRegionStarts(text_index["start_index"], current_speaker_end_index) <= 0
+                    and
+                    # If start_index starts before next_speaker_start_index
+                    word_document.Text.compareRegionStarts(text_index["start_index"], next_speaker_start_index) == 1
+                )
+            ]
+
+            if len(current_speaker_irrelevants) > 0:
+                End = __get_min_text_range(word_document, current_speaker_irrelevants)
+
+            else:
+                End = next_speaker_start_index
+
+            # Get the text from the end of current_speaker, to the start of the next_speaker
+            text_range = word_document.Text.createTextCursor()
+            text_range.gotoRange(current_speaker_end_index.getEnd(), False)  # Move to the end of current_speaker_end_index
+            text_range.gotoRange(End.getEnd(), True)  # Move to End, selecting it
+            text = text_range.getString()  # Get the text
+
+            # Replace all of them with space, later on we split to sentences correctly using ntlk
+            text = re2.sub(r"[\n\r\t\v\f]+", " ", text)
+
+            # Replace multiple spaces with a single space
+            text = re2.sub(r"\s+", " ", text)
+
+            text = text.strip()
+
+            self.speaker_text_consecutive.append(
+                {
+                    "speaker_name": current_speaker_name,
+                    "text": text,
+                }
+            )
+
+        if is_debug:
+            print(Delimiter)
+            print(f"self.speaker_text_consecutive[0:10]:")
+            pprint(self.speaker_text_consecutive[0:10], sort_dicts=False)
+
+        # Close the document without saving
+        word_document.dispose()
+
+        # Close LibreOffice after we are done using it, if it wasn't open before
+        if not was_libreoffice_headless_open_before:
+            KnessetProtocol.kill_libreoffice_headless()
+
     def load_document(self, document_path):
         """
         Loads and processes a Word document, extracting protocol metadata and speaker information.
@@ -1102,8 +1787,7 @@ class KnessetProtocol:
             self.load_document_windows(document_path)
 
         elif platform.system() == "Linux":
-            # TODO: Add suport for Linux
-            raise NotImplementedError(f"Platform {platform.system()} is not supported.")
+            self.load_document_linux(document_path)
 
         elif platform.system() == "Darwin":
             # TODO: Add suport for Darwin
@@ -1187,12 +1871,22 @@ class KnessetProtocol:
 
             return (
                 pl.when(pl.col(first_name_col).is_not_null() & pl.col(last_name_col).is_not_null())
-                .then(pl.struct([pl.col(first_name_col).alias("first_name"), pl.col(last_name_col).alias("last_name")]))
+                .then(
+                    pl.struct(
+                        [
+                            pl.col(first_name_col).alias("first_name"),
+                            pl.col(last_name_col).alias("last_name"),
+                        ]
+                    )
+                )
                 .otherwise(None)
             )
 
         struct_columns = [
-            __create_name_struct(("last_name" if (i == 1) else f"last_name_{i}"), ("first_name" if (j == 1) else f"first_name_{j}"))
+            __create_name_struct(
+                ("last_name" if (i == 1) else f"last_name_{i}"),
+                ("first_name" if (j == 1) else f"first_name_{j}"),
+            )
             for i in range(1, 4)
             for j in range(1, 4)
         ]
@@ -1233,7 +1927,14 @@ class KnessetProtocol:
         # 2. A column containing the number of words in last_name and first_name combined
         # We will use this later on.
         self.metadata = self.metadata.with_columns(
-            [pl.concat_list([pl.col("last_name").str.split(" "), pl.col("first_name").str.split(" ")]).alias("last_first_name")]
+            [
+                pl.concat_list(
+                    [
+                        pl.col("last_name").str.split(" "),
+                        pl.col("first_name").str.split(" "),
+                    ]
+                ).alias("last_first_name")
+            ]
         )
         self.metadata = self.metadata.with_columns(pl.col("last_first_name").list.len().alias("last_first_name_word_count"))
 
@@ -1335,8 +2036,16 @@ class KnessetProtocol:
         # Now we explode
         self.metadata = self.metadata.explode("speaker_name_combinations").explode("last_first_name_combinations")
         self.metadata = self.metadata.rename(
-            {"speaker_name_combinations": "speaker_name_combination", "last_first_name_combinations": "last_first_name_combination"}
-        ).drop("last_first_name", "last_first_name_word_count", "speaker_name_split", "speaker_name_split_len")
+            {
+                "speaker_name_combinations": "speaker_name_combination",
+                "last_first_name_combinations": "last_first_name_combination",
+            }
+        ).drop(
+            "last_first_name",
+            "last_first_name_word_count",
+            "speaker_name_split",
+            "speaker_name_split_len",
+        )
 
         def __get_similarity_ratio(row) -> float:
             """
@@ -1410,7 +2119,12 @@ class KnessetProtocol:
         )
 
         self.metadata = grouped_metadata.join(self.metadata, on=["speaker_name", "person_id"], how="inner").select(
-            ["speaker_name", "all_person_id_matches", "person_id", (pl.col("first_name") + " " + pl.col("last_name")).alias("person_name")]
+            [
+                "speaker_name",
+                "all_person_id_matches",
+                "person_id",
+                (pl.col("first_name") + " " + pl.col("last_name")).alias("person_name"),
+            ]
         )
 
         # We might have multiple first_name, last_name combinations for the same person_id - This is because we tried all of them
@@ -1444,7 +2158,10 @@ class KnessetProtocol:
 
             print(Delimiter)
             print("Not in self.speaker_to_person_mapping:")
-            pprint(speakers.difference(set(self.speaker_to_person_mapping.keys())), sort_dicts=False)
+            pprint(
+                speakers.difference(set(self.speaker_to_person_mapping.keys())),
+                sort_dicts=False,
+            )
 
         # Replace the speaker_name with person_name, and add person_id, all_person_id_matches to self.speaker_text_consecutive
         self.speaker_text_consecutive = [
@@ -1566,9 +2283,19 @@ class KnessetProtocol:
         arrow_table = self.res.to_arrow()
 
         # Define the schema explicitly (this should match your DataFrame)
-        schema = pa.schema([("protocol_type", pa.string()), ("knesset_number", pa.int64()), ("protocol_number", pa.int64())])
+        schema = pa.schema(
+            [
+                ("protocol_type", pa.string()),
+                ("knesset_number", pa.int64()),
+                ("protocol_number", pa.int64()),
+            ]
+        )
 
         # Write the dataset using the PyArrow table
         ds.write_dataset(
-            arrow_table, processed_data_path, format="parquet", partitioning=ds.HivePartitioning(schema), existing_data_behavior="overwrite_or_ignore"
+            arrow_table,
+            processed_data_path,
+            format="parquet",
+            partitioning=ds.HivePartitioning(schema),
+            existing_data_behavior="overwrite_or_ignore",
         )
