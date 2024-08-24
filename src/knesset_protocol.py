@@ -419,7 +419,7 @@ class KnessetProtocol:
         """
         Ensures the document name follows the required format:
         1 or 2 digits, followed by "ptm" or "ptv",
-        followed by at least one digit, and ending with .pdf, .docx, or .doc.
+        followed by at least one digit, and ending with .docx or .doc.
 
         Args:
             document_path (str): The full path to the document file.
