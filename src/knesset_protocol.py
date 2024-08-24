@@ -1058,6 +1058,7 @@ class KnessetProtocol:
 
         return False
 
+    @staticmethod
     def clean_speaker_name(speaker_name: str) -> str:
         """
         Cleans the speaker's name by removing party names, unwanted characters, and specific title variations.
