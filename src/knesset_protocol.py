@@ -1789,10 +1789,6 @@ class KnessetProtocol:
         elif platform.system() == "Linux":
             self.load_document_linux(document_path)
 
-        elif platform.system() == "Darwin":
-            # TODO: Add suport for Darwin
-            raise NotImplementedError(f"Platform {platform.system()} is not supported.")
-
         else:
             raise NotImplementedError(f"Platform {platform.system()} is not supported.")
 
