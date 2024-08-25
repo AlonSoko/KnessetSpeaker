@@ -139,9 +139,9 @@ To detect speaker names, the algorithm searches for underlined text between the 
   - **Results**: 100%
 
 **Accuracy Calculation**:
-\[
+```math
 \text{Accuracy} = \frac{TP + TN}{TP + TN + FP + FN} = \frac{0.988 + 1.0}{0.988 + 1.0 + 0.0 + 0.012} = \frac{1.988}{2} = 0.994
-\]
+```
 The identification process achieved an accuracy of 99.4%.
 
 **Challenges**:
@@ -166,9 +166,9 @@ This part of the test involved manually reviewing all distinct speaker names ide
   - **Results**: 100%
 
 **Accuracy Calculation**:
-\[
+```math
 \text{Accuracy} = \frac{TP + TN}{TP + TN + FP + FN} = \frac{1.0 + 1.0}{1.0 + 1.0 + 0.0 + 0.0} = 1.0
-\]
+```
 The matching process achieved a perfect accuracy of 100%.
 
 **Note**: This accuracy is based on the distinct speakers that were correctly identified in the first phase. Therefore, any undetected speakers were not included in this matching evaluation.
