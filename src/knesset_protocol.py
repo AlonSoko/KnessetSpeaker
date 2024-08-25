@@ -1920,7 +1920,7 @@ class KnessetProtocol:
         )
 
         # We add 2 columns:
-        # 1. A column that is a combination of all the words last name and first name cosist of
+        # 1. A column that is a combination of all the words last name and first name consist of
         # 2. A column containing the number of words in last_name and first_name combined
         # We will use this later on.
         self.metadata = self.metadata.with_columns(
@@ -1949,7 +1949,7 @@ class KnessetProtocol:
         # For example: שלומי כהן סלומון compared to (שלומי, כהן).
         # The סלומון will make our similarity be lower, even though it's actually the same name with additional name.
         #
-        # In addition, even though we cleaned the data, we might have words we missed
+        # To add on top of that, even though we cleaned the data, we might have words we missed
         # For example: שרת ממלכת הקסמים יעל בר זוהר - I didn't know that a minister of ממלכת הקסמים is a possibility, I didn't add it to my list of possible ministers,
         # And now שרת ממלכת הקסמים יעל בר זוהר and (יעל, בר-זהר) will get a very low similarity score.
 
@@ -1972,7 +1972,7 @@ class KnessetProtocol:
         # (יעל, זוהר)
         # (בר, זוהר)
         #
-        # But, remeber, we could have it also the other way around - אלון סוקולובסקי and (אלון שי, סוקולובסקי).
+        # But, remember, we could have it also the other way around - אלון סוקולובסקי and (אלון שי, סוקולובסקי).
         # So, we want to do it twice:
         # 1. For speaker_name_split, we want # of last_first_name_word_count combinations.
         # 2. For (last_name, first_name) we want # of speaker_name_split_len combinations.
