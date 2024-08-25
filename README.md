@@ -1,5 +1,7 @@
 # Knesset Speaker: Identifying Speaker Names in the Knesset Corpus and Matching Them to Actual Knesset Members
-Alon Sokolovski
+Authored by: Mr. Alon Sokolovski – alon.sokolovski@gmail.com
+Supervised by: Prof. Shuly Wintner – shuly@cs.haifa.ac.il, Mrs. Gili Goldin – gili.sommer@gmail.com
+Department of Computer Science, University of Haifa, Israel
 
 ## Overview
 
