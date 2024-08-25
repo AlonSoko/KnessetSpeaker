@@ -16,11 +16,15 @@ This project focuses on accurately identifying and correcting speaker names in t
     - [Implementation](#implementation)
   - [Metadata](#metadata)
   - [Speaker Matching](#speaker-matching)
+    - [Matching Speakers to Actual Knesset Members](#matching-speakers-to-actual-knesset-members)
   - [Sentence Splitting](#sentence-splitting)
   - [Output Format](#output-format)
     - [Why Parquet?](#why-parquet)
     - [Why PyArrow over Polars' Native write\_parquet?](#why-pyarrow-over-polars-native-write_parquet)
   - [Testing](#testing)
+    - [Overview](#overview-1)
+    - [Identifying Speaker Names in the Knesset Corpus](#identifying-speaker-names-in-the-knesset-corpus)
+    - [Matching Speaker Names to Actual Knesset Members](#matching-speaker-names-to-actual-knesset-members)
   - [References](#references)
 
 ## Introduction
@@ -59,7 +63,41 @@ A CSV file containing detailed information about Knesset Members was manually cu
 
 ## Speaker Matching
 
-TODO: Add
+### Matching Speakers to Actual Knesset Members
+
+The goal of this process is to accurately match speaker names in the Knesset protocols to the correct Knesset members, even when there are variations in name presentation. The process can be summarized as follows:
+
+1. **Identifying Distinct Speakers**: We begin by extracting all distinct speaker names from the protocol. This is crucial because, despite potentially hundreds of paragraphs in a protocol, the number of distinct speakers is usually under ten.
+
+2. **Creating Name Combinations**: To handle variations in names (e.g., nicknames or multiple given names), we generate all possible combinations of first and last names for each Knesset member. This is done by:
+   - Creating a list of name components (first name, last name, and any additional names) for each Knesset member, filtering out null values.
+   - Exploding this list so that each row in our DataFrame represents a unique name combination.
+
+   For example:
+   ```
+   person_id | last_name   | first_name | last_first_name    | last_first_name_word_count
+   ---------------------------------------------------------------------
+   2118      | אבו רוכן    | לביב       | אבו רוכן לביב      | 3
+   2118      | אבו רוכן    | חוסיין      | אבו רוכן חוסיין    | 3
+   ```
+
+3. **Cross-Joining Speakers with Knesset Members**: We perform a cross-join of all distinct speakers with the Knesset members, resulting in a table where each speaker is matched with every possible Knesset member. This allows us to compare each speaker's name against every possible name combination.
+
+4. **Handling Name Splitting**: Given that speaker names in the protocol may not be clearly split into first and last names, and might include additional words, we split these names into components and consider all possible combinations. This ensures we do not miss a match due to order or additional words in the speaker's name.
+
+5. **Similarity Calculation**: To compare the generated combinations with the names in the protocol, we:
+   - Sort the names lexicographically to avoid mismatches due to order.
+   - Use Python’s `SequenceMatcher` from the `difflib` library to calculate the similarity ratio between each combination. This algorithm identifies the longest contiguous matching subsequence between the two strings and uses it to calculate an overall similarity ratio.
+
+6. **Filtering by Threshold**: Based on the similarity ratios, we apply a threshold to filter out poor matches. Through empirical testing, a threshold of 0.9 was found to offer the best balance, ensuring minimal false positives and negatives.
+
+7. **Handling Collisions**: 
+   - **Multiple Person IDs for the Same Speaker**: In cases where a speaker name matches multiple Knesset members, we select the member with the highest person ID, which typically corresponds to the most recent Knesset member.
+   - **Multiple Matches for the Same Person ID**: If multiple name combinations for the same person ID match a speaker, we retain the combination with the maximum length. If multiple combinations have the same length, the lexicographic maximum is selected.
+
+8. **Final Mapping**: The results are converted into a mapping dictionary that associates each speaker's text with the correct Knesset member, including their person ID and any additional matches.
+
+This thorough matching process ensures that speaker names in the Knesset protocols are accurately linked to the correct Knesset members, despite variations and inconsistencies in name presentation.
 
 ## Sentence Splitting
 
@@ -82,7 +120,58 @@ The `get_results` method converted the processed data into a Polars DataFrame, e
 
 ## Testing
 
-TODO: Add
+### Overview
+
+This project had two primary objectives: **identifying speaker names** in the Knesset Corpus and **matching them to actual Knesset members**. Therefore, the testing phase was divided into two parts to evaluate the success of both objectives. The tests were conducted on a randomly selected sample of 10 documents.
+
+### Identifying Speaker Names in the Knesset Corpus
+
+To detect speaker names, the algorithm searches for underlined text between the first speaker index (typically the first mention of the chairman, assumed to start with “היו"ר”) and the last speaker index (which typically ends with “הישיבה נגמרה בשעה HH:MM”). The underlined text is then validated against a predefined regex pattern.
+
+**Key Metrics:**
+- **False Positive**: Instances where underlined text was incorrectly identified as a speaker.
+  - **Results**: 0%
+- **False Negative**: Instances where underlined text representing a speaker was not identified as such.
+  - **Results**: 1.2%
+- **True Positive**: Instances where underlined text correctly identified a speaker.
+  - **Results**: 98.8%
+- **True Negative**: Instances where non-speaker underlined text was correctly not identified as a speaker.
+  - **Results**: 100%
+
+**Accuracy Calculation**:
+\[
+\text{Accuracy} = \frac{TP + TN}{TP + TN + FP + FN} = \frac{0.988 + 1.0}{0.988 + 1.0 + 0.0 + 0.012} = \frac{1.988}{2} = 0.994
+\]
+The identification process achieved an accuracy of 99.4%.
+
+**Challenges**:
+- An example where a speaker’s name did not match the expected pattern highlighted a limitation: the regex enforced a colon (:) at the end of the speaker’s name, which in some cases led to missed detections.
+- Relaxing the regex constraints could introduce false positives, especially in cases where titles or other non-speaker text might be incorrectly identified as speakers.
+
+**Future Improvements**:
+- A more sophisticated approach could involve passing questionable cases through a Hebrew-trained language model to determine whether the text indicates a speaker and, if so, identify the speaker.
+
+### Matching Speaker Names to Actual Knesset Members
+
+This part of the test involved manually reviewing all distinct speaker names identified by the algorithm in the document and comparing them against known Knesset members.
+
+**Key Metrics:**
+- **False Positive**: Incorrect assignment of a Knesset member to a speaker.
+  - **Results**: 0%
+- **False Negative**: Instances where a speaker who should not have been assigned a Knesset member was assigned one.
+  - **Results**: 0%
+- **True Positive**: Correct assignment of a Knesset member to a speaker.
+  - **Results**: 100%
+- **True Negative**: Correctly not assigning a Knesset member to a non-member speaker.
+  - **Results**: 100%
+
+**Accuracy Calculation**:
+\[
+\text{Accuracy} = \frac{TP + TN}{TP + TN + FP + FN} = \frac{1.0 + 1.0}{1.0 + 1.0 + 0.0 + 0.0} = 1.0
+\]
+The matching process achieved a perfect accuracy of 100%.
+
+**Note**: This accuracy is based on the distinct speakers that were correctly identified in the first phase. Therefore, any undetected speakers were not included in this matching evaluation.
 
 ## References
 
