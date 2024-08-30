@@ -992,7 +992,7 @@ class KnessetProtocol:
         """
         Identifies the starting index of the end of the LibreOffice Writer word_document.
 
-        The assumption is that whether a committee or a plenary, it always ends with "הישיבה נגמרה בשעה HH:MM".
+        The assumption is that whether a committee or a plenary, it always ends with "הישיבה ננעלה בשעה HH:MM".
 
         Args:
             word_document: A LibreOffice Writer word_document object to be searched.
@@ -1001,11 +1001,15 @@ class KnessetProtocol:
         # Initialize last speaker index to None
         self.last_speaker_index = None
 
-        # Set up the search descriptor for the "הישיבה ננעלה" text
+        # Create a search descriptor
         search_descriptor = word_document.createSearchDescriptor()
-        # TODO: Do regex here so you also catch (הישיבה ננעלה)
-        search_descriptor.SearchString = "הישיבה ננעלה"
-        search_descriptor.SearchBackwards = True  # Search from the bottom up
+        search_descriptor.SearchString = r"[()]*הישיבה ננעלה" # Allows for paranthesis at the start, sometimes it's (הישיבה נעעלה בשעה)
+
+        # Enable regular expression search
+        search_descriptor.SearchRegularExpression = True
+
+        # Search from the bottom up
+        search_descriptor.SearchBackwards = True
 
         # Position the cursor at the end of the document
         search_range = word_document.Text.createTextCursor()
