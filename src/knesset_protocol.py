@@ -31,6 +31,9 @@ Delimiter = "*" + (100 * "-") + "*"
 # If the flag is true, enables debug prints
 is_debug = False
 
+# If the flag is true, saves intermediate results for evaluation purposes
+is_evaluation = False
+
 # Get the path of the project
 project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -39,6 +42,11 @@ metadata_path = os.path.join(project_dir, "metadata", "knesset_members.parquet")
 
 # Get the processed data path
 processed_data_path = os.path.join(project_dir, "data", "processed")
+
+# Get the evaluation paths
+evaluation_path = os.path.join(project_dir, "evaluation")
+speaker_detection_evaluation_path = os.path.join(evaluation_path, "speaker_detection")
+matching_evaluation_path = os.path.join(evaluation_path, "matching")
 
 # Dict of Hebrew numbers until the number 2000
 hebrew_numbers = {
@@ -326,7 +334,7 @@ def supported_system(required_system):
 class KnessetProtocol:
     def __init__(self, **kwargs):
         """
-        We can specify a debug status.
+        We can specify a debug status, and evaluation status.
 
         Then, initializes the object with either a document_path or filters.
 
@@ -335,7 +343,8 @@ class KnessetProtocol:
         2. filters - Apply filters to load an existing protocol.
 
         Args:
-            is_debug (bool, optional): If we want to specify a debug status.
+            is_debug (bool, optional): If we want to specify debug status.
+            is_evaluation (bool, optional): If we want to specify evaluation status.
             document_path (str, optional): The path to the document containing the protocol to be processed.
             filters (list of tuples, optional): A list of filter conditions to selectively read partitions from a protocol.
 
@@ -344,9 +353,13 @@ class KnessetProtocol:
         """
 
         global is_debug
+        global is_evaluation
 
         if "is_debug" in kwargs:
             is_debug = kwargs["is_debug"]
+
+        if "is_evaluation" in kwargs:
+            is_evaluation = kwargs["is_evaluation"]
 
         # Option 1: Process a new protocol if a document_path is provided
         if "document_path" in kwargs:
@@ -591,14 +604,14 @@ class KnessetProtocol:
         # Initialize protocol number to None
         self.protocol_number = None
 
-        keywords = ["הישיבה", "פרוטוקול מס"]
+        keywords = ["הישיבה", "פרוטוקול מספר", "פרוטוקול מס"]
 
         # Combine keywords into a single regex pattern
         keywords_pattern = r"|".join(re2.escape(keyword) for keyword in keywords)
 
         # Set up for each keyword their keyword_search_range
         keyword_search_ranges = []
-        for keyword in ["הישיבה", "פרוטוקול מס"]:
+        for keyword in keywords:
             # Set up the initial range for searching
             keyword_search_range = word_document.Content
 
@@ -617,13 +630,15 @@ class KnessetProtocol:
             }
 
             # For each search_range, check if it found something
-            for keyword_search_range_index, found in results.items():
+            keyword_search_ranges = [
+                keyword_search_range
+                for keyword_search_range_index, keyword_search_range in enumerate(keyword_search_ranges)
                 # If it no longer finds anything, we can remove it
-                if not found:
-                    del keyword_search_ranges[keyword_search_range_index]
+                if results[keyword_search_range_index]
+            ]
 
             # If after our deletion it's empty, break
-            if len(keyword_search_ranges) < 0:
+            if len(keyword_search_ranges) <= 0:
                 break
 
             # We want to find the argmin - the keyword_search_engine that found the earliest matching word
@@ -683,7 +698,7 @@ class KnessetProtocol:
         # Initialize protocol number to None
         self.protocol_number = None
 
-        keywords = ["הישיבה", "פרוטוקול מס"]
+        keywords = ["הישיבה", "פרוטוקול מספר", "פרוטוקול מס"]
 
         # Combine keywords into a single regex pattern
         keywords_pattern = r"|".join(re2.escape(keyword) for keyword in keywords)
@@ -802,7 +817,7 @@ class KnessetProtocol:
                 )
 
                 # If if it's a newline, it means this underline text is the start of a paragraph
-                is_paragraph_start = prev_char_range.Text in ["\r", "\n"]
+                is_paragraph_start = prev_char_range.Text in ["\r", "\n", ""]
 
             # If the underline text is not at the very end of the document, we want to get one char after it
             if chairman_search_range.End < word_document.Content.End:
@@ -878,7 +893,7 @@ class KnessetProtocol:
                 prev_char = prev_char_range.getString()  # Get the previous character as a string
 
                 # If it's a newline, it means this underlined text is the start of a paragraph
-                is_paragraph_start = prev_char in ["\r", "\n"]
+                is_paragraph_start = prev_char in ["\r", "\n", ""]
 
             # If the underline text is not at the very end of the word_document, we want to check the character after it
             if word_document.Text.compareRegionEnds(found_range, word_document.Text) == -1:
@@ -920,7 +935,7 @@ class KnessetProtocol:
         """
         Identifies the starting index of the end of the Word document.
 
-        The assumption is that whether a committee or a plenary, it always ends with "הישיבה נגמרה בשעה HH:MM"
+        The assumption is that whether a committee or a plenary, it always ends with "הישיבה ננעלה בשעה HH:MM"
 
         Args:
             word_document: A COM object representing the Word document to be searched.
@@ -943,6 +958,7 @@ class KnessetProtocol:
             is_paragraph_start = False
 
             # If the meeting_end text is at the very start of the document, it's obviously the start of a paragraph
+            paranthesis_count = 0
             if meeting_end_search_range.Start == word_document.Content.Start:
                 is_paragraph_start = True
 
@@ -953,11 +969,19 @@ class KnessetProtocol:
                     End=meeting_end_search_range.Start,
                 )
 
+                # Sometimes we have (הישיבה ננעלה בשעה) instead of just הישיבה ננעלה
+                while prev_char_range.Text in ["(", ")"]:
+                    paranthesis_count += 1
+                    prev_char_range = word_document.Range(
+                        Start=prev_char_range.Start - 1,
+                        End=prev_char_range.Start,
+                    )
+
                 # If if it's a newline, it means this meeting_end text is the start of a paragraph
-                is_paragraph_start = prev_char_range.Text in ["\r", "\n"]
+                is_paragraph_start = prev_char_range.Text in ["\r", "\n", ""]
 
             if is_paragraph_start:
-                self.last_speaker_index = meeting_end_search_range.Start
+                self.last_speaker_index = meeting_end_search_range.Start - paranthesis_count
                 break
 
         if self.last_speaker_index is None:
@@ -979,6 +1003,7 @@ class KnessetProtocol:
 
         # Set up the search descriptor for the "הישיבה ננעלה" text
         search_descriptor = word_document.createSearchDescriptor()
+        # TODO: Do regex here so you also catch (הישיבה ננעלה)
         search_descriptor.SearchString = "הישיבה ננעלה"
         search_descriptor.SearchBackwards = True  # Search from the bottom up
 
@@ -1007,7 +1032,7 @@ class KnessetProtocol:
                 prev_char = prev_char_range.getString()  # Get the previous character as a string
 
                 # If it's a newline, it means this underlined text is the start of a paragraph
-                is_paragraph_start = prev_char in ["\r", "\n"]
+                is_paragraph_start = prev_char in ["\r", "\n", ""]
 
             if is_paragraph_start:
                 self.last_speaker_index = found_range.getStart()
@@ -1206,7 +1231,7 @@ class KnessetProtocol:
                 prev_char_range = word_document.Range(Start=speaker_search_range.Start - 1, End=speaker_search_range.Start)
 
                 # If if it's a newline, it means this underline text is the start of a paragraph
-                is_paragraph_start = prev_char_range.Text in ["\r", "\n"]
+                is_paragraph_start = prev_char_range.Text in ["\r", "\n", ""]
 
             # If the underline text is not at the very end of the document, we want to get one char after it
             if speaker_search_range.End < self.last_speaker_index:
@@ -1323,7 +1348,7 @@ class KnessetProtocol:
                     prev_char = prev_char_range.getString()  # Get the previous character as a string
 
                     # If it's a newline, it means this underlined text is the start of a paragraph
-                    is_paragraph_start = prev_char in ["\r", "\n"]
+                    is_paragraph_start = prev_char in ["\r", "\n", ""]
 
                 # If the underline text is not at the very end of the word_document, we want to check the character after it
                 if word_document.Text.compareRegionEnds(found_range, self.last_speaker_index) == -1:
@@ -1434,6 +1459,43 @@ class KnessetProtocol:
             print(Delimiter)
             print("self.irrelevant_text_indexes")
             pprint(self.irrelevant_text_indexes, sort_dicts=False)
+
+        # Create a dataframe of underlined text, recognized and speaker, and should've been recognized as speaker.
+        # The latter will be manually filled by a human for evaluating how good the algorith is for detecting speakers in the underlined texts.
+        if is_evaluation:
+            self.speaker_detection_evaluation = pl.DataFrame(
+                [
+                    {"underlined_text": d["speaker_name"], "recognized_as_spaker": True, "shouldve_been_recognized": None}
+                    for d in self.speaker_names_indexes
+                ]
+            )
+            self.speaker_detection_evaluation = (
+                pl.concat(
+                    [
+                        self.speaker_detection_evaluation,
+                        pl.DataFrame(
+                            [
+                                {"underlined_text": d["text"], "recognized_as_spaker": False, "shouldve_been_recognized": None}
+                                for d in self.irrelevant_text_indexes
+                            ]
+                        ),
+                    ]
+                )
+                if len(self.irrelevant_text_indexes) > 0
+                else self.speaker_detection_evaluation
+            )
+
+            # Write to excel, so we can manually fill it in
+            xlsx_path = os.path.join(
+                project_dir,
+                speaker_detection_evaluation_path,
+                f"protocol_type={self.protocol_type}",
+                f"knesset_number={self.knesset_number}",
+                f"protocol_number={self.protocol_number}",
+            )
+            if not os.path.exists(xlsx_path):
+                os.makedirs(xlsx_path)
+            self.speaker_detection_evaluation.write_excel(os.path.join(xlsx_path, f"{self.protocol_name.split('.')[0]}_speaker_detection_evaluation"))
 
         # Create a list of consecutive speaker texts
         self.speaker_text_consecutive = []
@@ -2159,6 +2221,44 @@ class KnessetProtocol:
                 speakers.difference(set(self.speaker_to_person_mapping.keys())),
                 sort_dicts=False,
             )
+
+        # Create a dataframe of speakers, matched person, has match, and is match correct.
+        # The latter will be manually filled by a human for evaluating how good the algorith is for
+        # Matching speakers to Knesset members (or not matching non-Knesset-members to Knesset members).
+        if is_evaluation:
+            self.matching_evaluation = pl.DataFrame(
+                [
+                    {"speaker_name": k, "matched_person": v["person_name"], "has_match": True, "is_match_correct": None}
+                    for k, v in self.speaker_to_person_mapping.items()
+                ]
+            )
+            self.matching_evaluation = (
+                pl.concat(
+                    [
+                        self.matching_evaluation,
+                        pl.DataFrame(
+                            [
+                                {"speaker_name": speaker_name, "matched_person": None, "has_match": False, "is_match_correct": None}
+                                for speaker_name in speakers.difference(set(self.speaker_to_person_mapping.keys()))
+                            ]
+                        ),
+                    ]
+                )
+                if len(speakers.difference(set(self.speaker_to_person_mapping.keys()))) > 0
+                else self.matching_evaluation
+            )
+
+            # Write to excel, so we can manually fill it in
+            xlsx_path = os.path.join(
+                project_dir,
+                matching_evaluation_path,
+                f"protocol_type={self.protocol_type}",
+                f"knesset_number={self.knesset_number}",
+                f"protocol_number={self.protocol_number}",
+            )
+            if not os.path.exists(xlsx_path):
+                os.makedirs(xlsx_path)
+            self.matching_evaluation.write_excel(os.path.join(xlsx_path, f"{self.protocol_name.split('.')[0]}_matching_evaluation"))
 
         # Replace the speaker_name with person_name, and add person_id, all_person_id_matches to self.speaker_text_consecutive
         self.speaker_text_consecutive = [

@@ -134,19 +134,11 @@ To detect speaker names, the algorithm searches for underlined text between the 
 
 **Key Metrics:**
 - **False Positive**: Instances where underlined text was incorrectly identified as a speaker.
-  - **Results**: 0%
 - **False Negative**: Instances where underlined text representing a speaker was not identified as such.
-  - **Results**: 1.2%
 - **True Positive**: Instances where underlined text correctly identified a speaker.
-  - **Results**: 98.8%
 - **True Negative**: Instances where non-speaker underlined text was correctly not identified as a speaker.
-  - **Results**: 100%
 
-**Accuracy Calculation**:
-```math
-\text{Accuracy} = \frac{TP + TN}{TP + TN + FP + FN} = \frac{0.988 + 1.0}{0.988 + 1.0 + 0.0 + 0.012} = \frac{1.988}{2} = 0.994
-```
-The identification process achieved an accuracy of 99.4%.
+The identification process achieved an accuracy of 99.85%.
 
 **Challenges**:
 - An example where a speaker’s name did not match the expected pattern highlighted a limitation: the regex enforced a colon (:) at the end of the speaker’s name, which in some cases led to missed detections.
@@ -161,19 +153,11 @@ This part of the test involved manually reviewing all distinct speaker names ide
 
 **Key Metrics:**
 - **False Positive**: Incorrect assignment of a Knesset member to a speaker.
-  - **Results**: 0%
 - **False Negative**: Instances where a speaker who should not have been assigned a Knesset member was assigned one.
-  - **Results**: 0%
 - **True Positive**: Correct assignment of a Knesset member to a speaker.
-  - **Results**: 100%
 - **True Negative**: Correctly not assigning a Knesset member to a non-member speaker.
-  - **Results**: 100%
 
-**Accuracy Calculation**:
-```math
-\text{Accuracy} = \frac{TP + TN}{TP + TN + FP + FN} = \frac{1.0 + 1.0}{1.0 + 1.0 + 0.0 + 0.0} = 1.0
-```
-The matching process achieved a perfect accuracy of 100%.
+The matching process achieved an accuracy of 96.69%.
 
 **Note**: This accuracy is based on the distinct speakers that were correctly identified in the first phase. Therefore, any undetected speakers were not included in this matching evaluation.
 
